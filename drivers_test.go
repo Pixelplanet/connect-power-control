@@ -3,11 +3,15 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
+
+	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
 
 func TestLegacyModeBackwardsCompatibility(t *testing.T) {
@@ -329,5 +333,223 @@ func TestHomeAssistantDriver(t *testing.T) {
 	m.mu.RUnlock()
 	if plug == nil || plug.relayState(1) != "ON" || plug.FriendlyName != "Prusa XL Plug" || plug.PowerWatts == nil || *plug.PowerWatts != 118.5 {
 		t.Fatalf("unexpected HA plug telemetry: %+v", plug)
+	}
+}
+
+func TestAllMQTTDriversEndToEndOverRealBroker(t *testing.T) {
+	brk, err := StartEmbeddedBroker("127.0.0.1:0", "", "")
+	if err != nil {
+		t.Fatalf("StartEmbeddedBroker: %v", err)
+	}
+	defer func() { _ = brk.Close() }()
+
+	brokerURL := fmt.Sprintf("tcp://127.0.0.1:%d", brk.Port())
+
+	// Simulated smart-plug responder connected to the real TCP MQTT broker.
+	simClient := mqtt.NewClient(mqtt.NewClientOptions().
+		AddBroker(brokerURL).
+		SetClientID("plug-simulator").
+		SetConnectTimeout(2 * time.Second).
+		SetAutoReconnect(false))
+	if tok := simClient.Connect(); !tok.WaitTimeout(3*time.Second) || tok.Error() != nil {
+		t.Fatalf("simClient connect: %v", tok.Error())
+	}
+	defer simClient.Disconnect(50)
+
+	type recordedCmd struct {
+		Topic   string
+		Payload string
+	}
+	var recMu sync.Mutex
+	var recorded []recordedCmd
+	record := func(topic, payload string) {
+		recMu.Lock()
+		recorded = append(recorded, recordedCmd{Topic: topic, Payload: payload})
+		recMu.Unlock()
+	}
+
+	// Register virtual firmware handlers for all 6 MQTT drivers.
+	simSubs := map[string]func(payload string){
+		"shellies/shellyplug-sim/relay/0/command": func(p string) {
+			record("shellies/shellyplug-sim/relay/0/command", p)
+			simClient.Publish("shellies/shellyplug-sim/relay/0", 0, false, p)
+			if p == "on" {
+				simClient.Publish("shellies/shellyplug-sim/relay/0/power", 0, false, "115.2")
+			} else {
+				simClient.Publish("shellies/shellyplug-sim/relay/0/power", 0, false, "0")
+			}
+		},
+		"shellyplus-sim/command/switch:0": func(p string) {
+			record("shellyplus-sim/command/switch:0", p)
+			on := p == "on"
+			watts := 0.0
+			if on {
+				watts = 188.4
+			}
+			simClient.Publish("shellyplus-sim/status/switch:0", 0, false,
+				fmt.Sprintf(`{"id":0,"output":%t,"apower":%.1f,"voltage":230.5,"current":0.82}`, on, watts))
+		},
+		"zigbee2mqtt/z2m_sim/set": func(p string) {
+			record("zigbee2mqtt/z2m_sim/set", p)
+			var req map[string]string
+			if json.Unmarshal([]byte(p), &req) == nil {
+				st := req["state"]
+				watts := 0.0
+				if st == "ON" {
+					watts = 76.0
+				}
+				simClient.Publish("zigbee2mqtt/z2m_sim", 0, false,
+					fmt.Sprintf(`{"state":"%s","power":%.1f}`, st, watts))
+			}
+		},
+		"esphome-sim/switch/printer/command": func(p string) {
+			record("esphome-sim/switch/printer/command", p)
+			simClient.Publish("esphome-sim/switch/printer/state", 0, false, p)
+		},
+		"obk_sim/0/set": func(p string) {
+			record("obk_sim/0/set", p)
+			simClient.Publish("obk_sim/0/get", 0, false, p)
+			if p == "1" {
+				simClient.Publish("obk_sim/power/get", 0, false, "92.3")
+			} else {
+				simClient.Publish("obk_sim/power/get", 0, false, "0")
+			}
+		},
+		"custom/plug/cmd": func(p string) {
+			record("custom/plug/cmd", p)
+			simClient.Publish("custom/plug/stat", 0, false, fmt.Sprintf(`{"relay":"%s"}`, p))
+		},
+	}
+
+	for topic, handler := range simSubs {
+		h := handler
+		if tok := simClient.Subscribe(topic, 1, func(_ mqtt.Client, msg mqtt.Message) {
+			h(string(msg.Payload()))
+		}); !tok.WaitTimeout(2*time.Second) || tok.Error() != nil {
+			t.Fatalf("simClient subscribe %s: %v", topic, tok.Error())
+		}
+	}
+
+	// Connect the real extension module to the embedded broker.
+	m := newModule(nil)
+	s := normalizeSettings(Settings{
+		MQTTHost:     "127.0.0.1",
+		MQTTPort:     brk.Port(),
+		MQTTClientID: "ext-e2e-sim",
+	})
+	modClient := mqtt.NewClient(m.buildMQTTOptions(s, brokerURL, "ext-e2e-sim").SetAutoReconnect(false))
+	if tok := modClient.Connect(); !tok.WaitTimeout(3*time.Second) || tok.Error() != nil {
+		t.Fatalf("modClient connect: %v", tok.Error())
+	}
+	defer modClient.Disconnect(50)
+
+	cases := []struct {
+		name          string
+		cfg           DeviceConfig
+		wantTopic     string
+		wantPayloadOn string
+		wantPayloadOff string
+	}{
+		{
+			name:          "ShellyGen1",
+			cfg:           normalizeDeviceConfig(DeviceConfig{Driver: DriverShellyGen1, TasmotaTopic: "shellyplug-sim", RelayIndex: 1}),
+			wantTopic:     "shellies/shellyplug-sim/relay/0/command",
+			wantPayloadOn: "on",
+			wantPayloadOff: "off",
+		},
+		{
+			name:          "ShellyGen2",
+			cfg:           normalizeDeviceConfig(DeviceConfig{Driver: DriverShellyGen2, TasmotaTopic: "shellyplus-sim", RelayIndex: 1}),
+			wantTopic:     "shellyplus-sim/command/switch:0",
+			wantPayloadOn: "on",
+			wantPayloadOff: "off",
+		},
+		{
+			name:          "Zigbee2MQTT",
+			cfg:           normalizeDeviceConfig(DeviceConfig{Driver: DriverZigbee2MQTT, TasmotaTopic: "z2m_sim", RelayIndex: 1}),
+			wantTopic:     "zigbee2mqtt/z2m_sim/set",
+			wantPayloadOn: `{"state":"ON"}`,
+			wantPayloadOff: `{"state":"OFF"}`,
+		},
+		{
+			name:          "ESPHome",
+			cfg:           normalizeDeviceConfig(DeviceConfig{Driver: DriverESPHome, TasmotaTopic: "esphome-sim/switch/printer"}),
+			wantTopic:     "esphome-sim/switch/printer/command",
+			wantPayloadOn: "ON",
+			wantPayloadOff: "OFF",
+		},
+		{
+			name:          "OpenBeken",
+			cfg:           normalizeDeviceConfig(DeviceConfig{Driver: DriverOpenBeken, TasmotaTopic: "obk_sim", RelayIndex: 1}),
+			wantTopic:     "obk_sim/0/set",
+			wantPayloadOn: "1",
+			wantPayloadOff: "0",
+		},
+		{
+			name: "GenericMQTT",
+			cfg: normalizeDeviceConfig(DeviceConfig{
+				Driver:           DriverGenericMQTT,
+				MQTTCommandTopic: "custom/plug/cmd",
+				MQTTStateTopic:   "custom/plug/stat",
+				MQTTPayloadOn:    "ENABLE",
+				MQTTPayloadOff:   "DISABLE",
+				MQTTStateJSONKey: "relay",
+			}),
+			wantTopic:      "custom/plug/cmd",
+			wantPayloadOn:  "ENABLE",
+			wantPayloadOff: "DISABLE",
+		},
+	}
+
+	m.mu.Lock()
+	m.mqttClient = modClient
+	m.mqttUp = true
+	for _, tc := range cases {
+		m.configs["dev-"+tc.name] = tc.cfg
+	}
+	m.mu.Unlock()
+
+	m.syncDriverSubscriptions()
+	time.Sleep(150 * time.Millisecond)
+
+	ctx := context.Background()
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := m.switchDevicePower(ctx, tc.cfg, true); err != nil {
+				t.Fatalf("%s ON failed: %v", tc.name, err)
+			}
+			m.mu.RLock()
+			stOn := m.plugs[tc.cfg.plugKey()].relayState(tc.cfg.relayIndex())
+			m.mu.RUnlock()
+			if stOn != "ON" {
+				t.Fatalf("%s state after ON = %q, want ON", tc.name, stOn)
+			}
+
+			if err := m.switchDevicePower(ctx, tc.cfg, false); err != nil {
+				t.Fatalf("%s OFF failed: %v", tc.name, err)
+			}
+			m.mu.RLock()
+			stOff := m.plugs[tc.cfg.plugKey()].relayState(tc.cfg.relayIndex())
+			m.mu.RUnlock()
+			if stOff != "OFF" {
+				t.Fatalf("%s state after OFF = %q, want OFF", tc.name, stOff)
+			}
+
+			recMu.Lock()
+			var sawOn, sawOff bool
+			for _, c := range recorded {
+				if c.Topic == tc.wantTopic && c.Payload == tc.wantPayloadOn {
+					sawOn = true
+				}
+				if c.Topic == tc.wantTopic && c.Payload == tc.wantPayloadOff {
+					sawOff = true
+				}
+			}
+			recMu.Unlock()
+			if !sawOn || !sawOff {
+				t.Fatalf("%s did not receive expected commands on %s (sawOn=%v sawOff=%v)", tc.name, tc.wantTopic, sawOn, sawOff)
+			}
+			t.Logf("SIMULATED %s OK: %s received %q -> ON, %q -> OFF", tc.name, tc.wantTopic, tc.wantPayloadOn, tc.wantPayloadOff)
+		})
 	}
 }
