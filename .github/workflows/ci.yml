@@ -21,7 +21,17 @@ jobs:
       - uses: actions/setup-node@v5
         with:
           node-version: 22
-      - run: make check
+      - name: Go check
+        run: make go-check
+      - name: UI check
+        run: |
+          set -o pipefail
+          make ui-check 2>&1 | tee /tmp/ui-check.log || {
+            grep -E "Error:|Warn:|error TS|svelte" /tmp/ui-check.log | head -n 10 | while IFS= read -r line; do
+              echo "::error::$line"
+            done
+            exit 1
+          }
       - run: make release
       - name: Throwaway signing key
         run: |
