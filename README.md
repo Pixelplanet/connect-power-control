@@ -1,6 +1,33 @@
 # Tasmota Power Control (`connect-power-control`)
 
+![Tasmota Power Control](docs/marketplace_logo.png)
+
 Controls and monitors Tasmota smart plugs for printers inside Prusa Connect Local via an external MQTT broker, the optional built-in MQTT 3.1.1 broker, or per-printer Direct HTTP (`/cm`) without a broker.
+
+## Screenshots
+
+### Dark Mode
+
+| Settings & Plug Assignments | Printer Power Control & Live Graph |
+|---|---|
+| ![Settings (Dark Mode)](docs/01_settings_dark.png) | ![Printer Power Control (Dark Mode)](docs/02_printer_graph_dark.png) |
+
+| Turn-Off Confirmation Dialog |
+|---|
+| ![Turn-Off Confirmation (Dark Mode)](docs/03_turnoff_modal_dark.png) |
+
+<details>
+<summary>Light Mode Screenshots</summary>
+
+| Settings & Plug Assignments | Printer Power Control & Live Graph |
+|---|---|
+| ![Settings (Light Mode)](docs/04_settings_light.png) | ![Printer Power Control (Light Mode)](docs/05_printer_graph_light.png) |
+
+| Turn-Off Confirmation Dialog |
+|---|
+| ![Turn-Off Confirmation (Light Mode)](docs/06_turnoff_modal_light.png) |
+
+</details>
 
 ## Features
 
