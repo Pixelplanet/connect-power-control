@@ -1,8 +1,8 @@
-# Tasmota Power Control (`connect-power-control`)
+# Connect Power Control (`connect-power-control`)
 
-![Tasmota Power Control](docs/marketplace_logo.png)
+![Connect Power Control](docs/marketplace_logo.png)
 
-Controls and monitors Tasmota smart plugs for printers inside Prusa Connect Local via an external MQTT broker, the optional built-in MQTT 3.1.1 broker, or per-printer Direct HTTP (`/cm`) without a broker.
+Switches and monitors the smart plug of each printer inside Prusa Connect Local: Tasmota, Shelly, Zigbee2MQTT, ESPHome, OpenBeken, any other MQTT plug, and any switch Home Assistant controls. A plug is reached through an MQTT broker, directly by its IP address, or through Home Assistant.
 
 ## Screenshots
 
@@ -31,23 +31,35 @@ Controls and monitors Tasmota smart plugs for printers inside Prusa Connect Loca
 
 ## Features
 
-- **Three Connection Options**:
-  - **External MQTT Broker**: Connect to Mosquitto or an existing LAN/TLS broker with credentials and live connection testing.
-  - **Optional Built-in MQTT Broker (Port 1883)**: Run a lightweight embedded MQTT 3.1/3.1.1 broker inside the extension, with automatic conflict detection if another MQTT broker is already on the network or Docker `-p 1883:1883` is missing.
-  - **Direct HTTP (IP) per Printer**: Connect directly to a Tasmota plug's IP over HTTP (`/cm?cmnd=Status 0` & `POWER<n>`) with optional Web Password and zero MQTT setup.
-- **Auto-Discovery & Multi-Relay Support (`POWER1`–`POWER8`)**: Discovers Tasmota plugs via `tasmota/discovery/+/config` (with fallback manual topic input) and prevents assigning the same plug/relay to two printers.
-- **Broad Tasmota Compatibility**: Handles `SetOption4 1`, `SetOption26 1`, `SetOption90 1`, custom `StateText1..4`, custom `FullTopic` / `Prefix1..3`, empty `PowerRetain 0` clear payloads, `Status 8`/`10`/`11`, stale `LWT` protection, and verified switching.
-- **Active-Print & Axis Motion Safety Interlock**: Blocks power-off while printing, paused, busy, or while printer axes (`/axis/x`, `/axis/y`, `/axis/z`) are moving.
-- **Auto-Off After Print & Configurable Turn-Off Confirmation**: Optional one-shot auto-off cooldown after motion stops, plus optional confirmation dialog on manual Turn Off.
-- **Live Power Graph & Energy Tracking**: 5-second active polling, 30-minute rolling wattage graph, current/last turn-on session totals (`Wh`/`kWh`, duration, average/peak `W`), and per-print file energy history.
+- **Ten plug drivers in one extension**: Tasmota (MQTT or by IP address), Shelly Gen1 and Gen2+ (MQTT or by IP address), Zigbee2MQTT, ESPHome, OpenBeken, custom MQTT topics, and Home Assistant for Kasa, Tapo, Tuya, Matter and the rest.
+- **Guided setup**: pick the plug, pick how Connect reaches it, fill in only what that plug needs. Plugs the broker finds and Home Assistant entities are picked from a list. The dialog says whether the plug answered.
+- **Three ways to connect**:
+  - **Your own MQTT broker**, with TLS, credentials and a connection test.
+  - **The built-in MQTT broker** (TCP 1883 by default), for a network with no broker. It listens only on a port you approve, and warns when another broker already answers on that address.
+  - **Directly by IP address**, with no broker at all.
+- **Active-print safety lock**: turning off is refused while the printer prints, is paused or busy, or while its axes still move.
+- **Auto-off after a print**: per printer, after a delay you set for all printers or for one. Turning off by hand asks first unless you switch the question off.
+- **Power page and dashboard card**: what the fleet draws now, which plugs are on, and buttons that switch each plug.
+- **Power graph and energy figures**: a 30-minute graph per printer, the energy since the plug was turned on, and the energy of each print.
+- **Broad Tasmota compatibility**: multi-relay devices (`POWER1`–`POWER8`), `SetOption4`, `SetOption26`, `SetOption90`, custom `StateText`, custom `FullTopic` and prefixes, stale `LWT` protection, and verified switching.
+
+## Where to find it
+
+| place | what is there |
+|---|---|
+| Settings, Extensions, Connect Power Control, **Plugs** | every printer with its plug; set up, change, remove |
+| the same page, **Connections** | the MQTT broker and Home Assistant |
+| the same page, **Automation** | the power-off rules and each printer's auto-off |
+| **Power** in the sidebar | the whole fleet at once |
+| a printer's page, **Power Control** | that printer's plug, graph and energy |
 
 ## Building & Testing
 
 ```sh
-make check    # clones core at CORE_REF into .core/, vets & tests Go, type-checks & builds UI
+make check    # clones core at CORE_REF into .core/, vets & tests Go, lints, type-checks & builds UI
 make release  # builds all platforms declared in module.yaml into release/
 ```
 
-## Docker Note for Built-in MQTT Broker
+## The built-in MQTT broker in Docker
 
-If Prusa Connect runs inside a bridge-networked Docker container and you enable **Run built-in MQTT broker**, publish TCP port `1883` (`-p 1883:1883`) on the container so smart plugs on your LAN can connect to it. **Direct HTTP (IP)** requires no inbound container ports.
+If Prusa Connect runs in a bridge-networked Docker container and you switch on the built-in broker, publish its port on the container (`-p 1883:1883`) so the plugs on your network can reach it. Approve the port on the extension's Ports tab first; you can also move it there. A plug reached by its IP address needs no port on the container.

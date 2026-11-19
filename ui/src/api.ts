@@ -16,32 +16,6 @@ export type PlugDriver =
   | 'generic_mqtt'
   | 'homeassistant';
 
-export const PLUG_DRIVER_OPTIONS: Array<{ value: PlugDriver; label: string }> = [
-  { value: 'tasmota', label: 'Tasmota (MQTT)' },
-  { value: 'tasmota_http', label: 'Tasmota (Direct HTTP)' },
-  { value: 'shelly_gen2', label: 'Shelly Gen2 / Plus / Pro (MQTT)' },
-  { value: 'shelly_gen1', label: 'Shelly Gen1 (MQTT)' },
-  { value: 'shelly_http', label: 'Shelly Gen1 / Gen2+ (Direct HTTP)' },
-  { value: 'zigbee2mqtt', label: 'Zigbee2MQTT' },
-  { value: 'esphome', label: 'ESPHome (MQTT)' },
-  { value: 'openbeken', label: 'OpenBeken (MQTT)' },
-  { value: 'generic_mqtt', label: 'Generic MQTT (Custom Topics)' },
-  { value: 'homeassistant', label: 'Home Assistant (REST)' },
-];
-
-export const DRIVER_BADGE_LABELS: Record<PlugDriver, string> = {
-  tasmota: 'Tasmota',
-  tasmota_http: 'Tasmota HTTP',
-  shelly_gen1: 'Shelly Gen1',
-  shelly_gen2: 'Shelly Gen2+',
-  shelly_http: 'Shelly HTTP',
-  zigbee2mqtt: 'Zigbee2MQTT',
-  esphome: 'ESPHome',
-  openbeken: 'OpenBeken',
-  generic_mqtt: 'Generic MQTT',
-  homeassistant: 'Home Assistant',
-};
-
 export interface HAEntity {
   entity_id: string;
   friendly_name?: string | undefined;
@@ -54,11 +28,12 @@ export interface HAEntity {
 export interface HATestResult {
   ok: boolean;
   url?: string | undefined;
-  entities?: HAEntity[] | undefined;
+  // The process answers null, not an empty list, when it found none.
+  entities?: HAEntity[] | null | undefined;
   error?: string | undefined;
 }
 
-export interface TasmotaSettings {
+export interface PlugSettings {
   mqtt_builtin: boolean;
   mqtt_host: string;
   mqtt_port: number;
@@ -77,7 +52,7 @@ export interface TasmotaSettings {
 }
 
 export interface SettingsResponse {
-  settings: TasmotaSettings;
+  settings: PlugSettings;
   mqtt_configured: boolean;
   mqtt_connected: boolean;
   mqtt_broker?: string | undefined;
@@ -86,7 +61,14 @@ export interface SettingsResponse {
   mqtt_builtin_running: boolean;
   mqtt_builtin_port?: number | undefined;
   mqtt_builtin_clients: number;
+  /** The operator approved the built-in broker's port. */
+  mqtt_builtin_granted?: boolean | undefined;
   ha_configured: boolean;
+  /** Written in the host's own settings for this extension, so read-only here. */
+  mqtt_host_pinned?: boolean | undefined;
+  ha_url_pinned?: boolean | undefined;
+  /** The address offered when a plug is set up by IP address. */
+  suggested_http_host?: string | undefined;
 }
 
 export interface BrokerTestResult {
@@ -122,7 +104,9 @@ export interface DeviceConfig {
   cooldown_sec?: number | undefined;
 }
 
-export function effectiveDriver(cfg: DeviceConfig | undefined): PlugDriver | '' {
+export function effectiveDriver(
+  cfg: DeviceConfig | undefined,
+): PlugDriver | '' {
   if (!cfg) return '';
   if (cfg.driver) return cfg.driver;
   if (cfg.mode === 'http') return 'tasmota_http';
@@ -146,26 +130,11 @@ export function isDeviceConfigured(cfg: DeviceConfig | undefined): boolean {
     case 'generic_mqtt':
       return Boolean(cfg.mqtt_command_topic?.trim());
     default:
-      return Boolean(cfg.tasmota_topic?.trim());
+      return Boolean(cfg.tasmota_topic.trim());
   }
 }
 
-export function driverUsesMQTT(driver: PlugDriver | ''): boolean {
-  return (
-    driver === 'tasmota' ||
-    driver === 'shelly_gen1' ||
-    driver === 'shelly_gen2' ||
-    driver === 'zigbee2mqtt' ||
-    driver === 'esphome' ||
-    driver === 'openbeken' ||
-    driver === 'generic_mqtt'
-  );
-}
-
-export function driverUsesHTTP(driver: PlugDriver | ''): boolean {
-  return driver === 'tasmota_http' || driver === 'shelly_http';
-}
-
+/** The address a person knows the plug by: its topic, its host or its entity. */
 export function driverDisplayTarget(cfg: DeviceConfig | undefined): string {
   if (!cfg) return '';
   const d = effectiveDriver(cfg);
@@ -178,9 +147,22 @@ export function driverDisplayTarget(cfg: DeviceConfig | undefined): string {
     case 'generic_mqtt':
       return cfg.mqtt_command_topic ?? '';
     default:
-      return cfg.tasmota_topic ?? '';
+      return cfg.tasmota_topic;
   }
 }
+
+/** The relay a config names. An absent relay, or a zero, is the first. */
+export const relayIndexOf = (cfg: DeviceConfig | undefined): number => {
+  const relay = cfg?.relay_index;
+
+  return relay === undefined || relay < 1 ? 1 : relay;
+};
+
+/** A text that says something, or `fallback` for an absent or empty one. */
+export const textOr = (value: string | undefined, fallback: string): string =>
+  value === undefined || value === '' ? fallback : value;
+
+export type PowerState = 'ON' | 'OFF' | 'UNKNOWN';
 
 export interface PlugTelemetry {
   topic?: string;
@@ -189,15 +171,21 @@ export interface PlugTelemetry {
   model?: string;
   relay_count?: number;
   relay_names?: string[];
-  relays?: Record<string, 'ON' | 'OFF' | 'UNKNOWN'>;
-  power: 'ON' | 'OFF' | 'UNKNOWN';
-  online?: boolean;
-  power_watts?: number;
-  voltage?: number;
-  current_amps?: number;
+  relays?: Record<string, PowerState>;
+  power: PowerState;
+  // The process answers null, not an absent key, for what a plug never said.
+  online?: boolean | null;
+  power_watts?: number | null;
+  voltage?: number | null;
+  current_amps?: number | null;
   last_error?: string;
   updated_at?: string;
 }
+
+/** A reading a plug gave, or undefined for one it never gave. Never a zero. */
+export const readingOf = (
+  value: number | null | undefined,
+): number | undefined => value ?? undefined;
 
 export interface PowerSample {
   ts: number;
@@ -236,7 +224,7 @@ export interface PowerStatus {
   ha_configured?: boolean;
   config: DeviceConfig;
   plug?: PlugTelemetry;
-  discovered_plugs?: PlugTelemetry[];
+  discovered_plugs?: PlugTelemetry[] | null;
   can_turn_off: boolean;
   lock_reason?: string;
   printer_connected: boolean;
@@ -255,14 +243,36 @@ export interface PowerStatus {
 
 export interface AssignmentsResponse {
   assignments: Record<string, DeviceConfig>;
-  discovered_plugs: PlugTelemetry[];
+  // The process answers null, not an empty list, for a list with nothing in it.
+  discovered_plugs: PlugTelemetry[] | null;
   mqtt_configured: boolean;
   mqtt_connected: boolean;
   mqtt_broker?: string;
   mqtt_error?: string;
   ha_configured?: boolean;
-  ha_entities?: HAEntity[];
+  ha_entities?: HAEntity[] | null;
   default_cooldown_sec: number;
+}
+
+/** One printer's plug in the fleet overview. */
+export interface OverviewEntry {
+  device_id: string;
+  config: DeviceConfig;
+  plug?: PlugTelemetry;
+  session_usage?: PowerSession;
+  current_print_usage?: PrintPowerRecord;
+}
+
+/** Every printer with a plug the person may see, in one answer. */
+export interface OverviewResponse {
+  devices: OverviewEntry[];
+  mqtt_configured: boolean;
+  mqtt_connected: boolean;
+  mqtt_error?: string;
+  ha_configured: boolean;
+  default_cooldown_sec: number;
+  confirm_turn_off: boolean;
+  poll_interval_sec: number;
 }
 
 const opGetSettings: Operation = {
@@ -316,6 +326,14 @@ const opGetAssignments: Operation = {
   anonymous: false,
 };
 
+const opGetOverview: Operation = {
+  id: 'get-power-overview',
+  method: 'GET',
+  path: `${BASE}/overview`,
+  response: 'json',
+  anonymous: false,
+};
+
 const opGetStatus: Operation = {
   id: 'get-device-power',
   method: 'GET',
@@ -357,23 +375,29 @@ export function createApi(host: Pick<ModuleHost, 'client'>) {
     getSettings: (signal?: AbortSignal) =>
       t.call<SettingsResponse>(opGetSettings, {}, signal),
 
-    saveSettings: (settings: Partial<TasmotaSettings>) =>
+    saveSettings: (settings: Partial<PlugSettings>) =>
       t.call<SettingsResponse>(opPutSettings, { body: settings }),
 
-    testBroker: (settings?: Partial<TasmotaSettings>) =>
+    testBroker: (settings?: Partial<PlugSettings>) =>
       t.call<BrokerTestResult>(opTestBroker, { body: settings ?? {} }),
 
-    testHomeAssistant: (settings?: Partial<TasmotaSettings>) =>
+    testHomeAssistant: (settings?: Partial<PlugSettings>) =>
       t.call<HATestResult>(opTestHomeAssistant, { body: settings ?? {} }),
 
-    discoverPlugs: () =>
-      t.call<{ plugs: PlugTelemetry[] }>(opDiscover, {}),
+    discoverPlugs: () => t.call<{ plugs: PlugTelemetry[] }>(opDiscover, {}),
 
     getAssignments: (signal?: AbortSignal) =>
       t.call<AssignmentsResponse>(opGetAssignments, {}, signal),
 
+    getOverview: (signal?: AbortSignal) =>
+      t.call<OverviewResponse>(opGetOverview, {}, signal),
+
     getStatus: (deviceId: string, signal?: AbortSignal) =>
-      t.call<PowerStatus>(opGetStatus, { path: { device_id: deviceId } }, signal),
+      t.call<PowerStatus>(
+        opGetStatus,
+        { path: { device_id: deviceId } },
+        signal,
+      ),
 
     saveConfig: (deviceId: string, config: DeviceConfig) =>
       t.call<PowerStatus>(opPutConfig, {
@@ -394,3 +418,5 @@ export function createApi(host: Pick<ModuleHost, 'client'>) {
       }),
   };
 }
+
+export type PowerApi = ReturnType<typeof createApi>;

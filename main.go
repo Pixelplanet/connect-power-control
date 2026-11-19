@@ -74,6 +74,23 @@ type Settings struct {
 	MQTTBroker string `json:"mqtt_broker,omitempty"`
 }
 
+// builtinListenName is the name module.yaml gives the built-in broker's port
+// under needs.listen. The operator approves the port and may move it.
+const builtinListenName = "mqtt"
+
+// hostSettings is what the host sends on plugin.configure: the options
+// module.yaml declares, as the operator wrote them on the extension's own
+// Settings tab or in the server's configuration. The host decodes strictly, so
+// every declared option needs a field here: a key with no field refuses the
+// start.
+type hostSettings struct {
+	Settings
+
+	// HTTPHost is the http_host option. A plug's address is kept per printer,
+	// so this one only fills in the address field when a plug is set up.
+	HTTPHost string `json:"http_host,omitempty"`
+}
+
 func boolPtr(v bool) *bool { return &v }
 
 func (s Settings) confirmTurnOffEnabled() bool {
@@ -171,9 +188,15 @@ func (s Settings) haConfigured() bool {
 	return normalizeBaseURL(s.HAURL) != "" && strings.TrimSpace(s.HAToken) != ""
 }
 
-func (s Settings) brokerURL() string {
+// brokerURL is the address this module's own MQTT client dials. For the
+// built-in broker that is the loopback address on the port the operator
+// granted, and empty while no port is granted.
+func (s Settings) brokerURL(builtinPort int) string {
 	if s.MQTTBuiltin {
-		return fmt.Sprintf("tcp://%s", net.JoinHostPort("127.0.0.1", strconv.Itoa(defaultMQTTPort)))
+		if builtinPort <= 0 {
+			return ""
+		}
+		return fmt.Sprintf("tcp://%s", net.JoinHostPort("127.0.0.1", strconv.Itoa(builtinPort)))
 	}
 	host := strings.TrimSpace(s.MQTTHost)
 	if host == "" {
@@ -597,8 +620,15 @@ type module struct {
 
 	held atomic.Pointer[Settings]
 
-	mu             sync.RWMutex
-	dataDir        string
+	mu      sync.RWMutex
+	dataDir string
+	// What the host sent on plugin.configure. A pinned value is one the
+	// operator wrote in the host's own settings; it wins over settings.json.
+	pinnedMQTTHost    string
+	pinnedHAURL       string
+	suggestedHTTPHost string
+	// builtinPort is the port granted for the built-in broker, 0 when none is.
+	builtinPort    int
 	mqttClient     mqtt.Client
 	mqttUp         bool
 	mqttBroker     string
@@ -637,6 +667,59 @@ func (m *module) settings() Settings {
 	return defaultSettings()
 }
 
+// setHostConfig keeps what plugin.configure carried beside the settings: the
+// values the operator pinned in the host's own settings, and the port granted
+// for the built-in broker.
+func (m *module) setHostConfig(sent hostSettings, grants wirerpc.Grants) {
+	port := 0
+	if grant, ok := grants.Listen[builtinListenName]; ok && grant.Port > 0 {
+		port = grant.Port
+	}
+	m.mu.Lock()
+	m.pinnedMQTTHost = strings.TrimSpace(sent.MQTTHost)
+	m.pinnedHAURL = normalizeBaseURL(sent.HAURL)
+	m.suggestedHTTPHost = normalizeHTTPHost(sent.HTTPHost)
+	m.builtinPort = port
+	m.mu.Unlock()
+}
+
+// startSettings is what the module runs on after plugin.configure: what
+// settings.json holds, or the defaults on an install that has saved nothing
+// yet, with the values the operator pinned written over either.
+func (m *module) startSettings(sent hostSettings) Settings {
+	effective := defaultSettings()
+	if stored, ok := m.loadSettingsFromDisk(); ok {
+		effective = stored
+	} else if legacy := normalizeSettings(sent.Settings); legacy.MQTTHost != "" || legacy.MQTTBuiltin || legacy.HAURL != "" {
+		// Migrate legacy host-passed settings into settings.json once.
+		effective = legacy
+		_ = m.writeSettingsToDisk(effective)
+	}
+
+	return m.applyHostPins(effective)
+}
+
+// applyHostPins writes the values the operator pinned in the host's settings
+// over s, so the two places a host can be written never disagree.
+func (m *module) applyHostPins(s Settings) Settings {
+	m.mu.RLock()
+	host, haURL := m.pinnedMQTTHost, m.pinnedHAURL
+	m.mu.RUnlock()
+	if host != "" {
+		s.MQTTHost = host
+	}
+	if haURL != "" {
+		s.HAURL = haURL
+	}
+	return normalizeSettings(s)
+}
+
+func (m *module) grantedBuiltinPort() int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.builtinPort
+}
+
 func main() {
 	if err := run(); err != nil {
 		fmt.Fprintf(os.Stderr, "%s: %v\n", logName, err)
@@ -673,20 +756,15 @@ func run() error {
 					Serves:   []wirerpc.Method{wirerpc.MethodConfigure},
 				}, openAPI)
 			},
-			wirerpc.MethodConfigure: wirerpc.ConfigureGranted(func(_ context.Context, sent Settings, grants wirerpc.Grants) error {
+			wirerpc.MethodConfigure: wirerpc.ConfigureGranted(func(_ context.Context, sent hostSettings, grants wirerpc.Grants) error {
 				if grants.Data != "" {
 					mod.setDataDir(grants.Data)
 					mod.loadAllConfigs()
 					mod.loadAllUsage()
 				}
+				mod.setHostConfig(sent, grants)
 
-				effective := normalizeSettings(sent)
-				if stored, ok := mod.loadSettingsFromDisk(); ok {
-					effective = stored
-				} else if effective.MQTTHost != "" || effective.MQTTBuiltin || effective.HAURL != "" {
-					// Migrate legacy host-passed settings into settings.json once.
-					_ = mod.writeSettingsToDisk(effective)
-				}
+				effective := mod.startSettings(sent)
 
 				mod.held.Store(&effective)
 				mod.reconnectMQTT(effective)
@@ -1188,7 +1266,7 @@ func (m *module) probeBuiltinBrokerReachability(brk *EmbeddedBroker, rawHost str
 	target := net.JoinHostPort(host, strconv.Itoa(brk.Port()))
 	conn, err := net.DialTimeout("tcp", target, 1500*time.Millisecond)
 	if err != nil {
-		return fmt.Sprintf("Built-in broker is listening internally on :%d, but %s is not reachable (%v). If Prusa Connect runs in a Docker container (bridge network), publish TCP port 1883 (-p 1883:1883) on the container so smart plugs on your LAN can reach it — or use Direct HTTP (IP).", brk.Port(), target, err)
+		return fmt.Sprintf("Built-in broker is listening internally on :%d, but %s is not reachable (%v). If Prusa Connect runs in a Docker container (bridge network), publish TCP port %d (-p %d:%d) on the container so smart plugs on your LAN can reach it — or connect the plug directly by its IP address.", brk.Port(), target, err, brk.Port(), brk.Port(), brk.Port())
 	}
 	time.Sleep(60 * time.Millisecond)
 	_ = conn.Close()
@@ -1200,7 +1278,8 @@ func (m *module) probeBuiltinBrokerReachability(brk *EmbeddedBroker, rawHost str
 
 func (m *module) reconnectMQTT(s Settings) {
 	m.disconnectMQTT()
-	brokerURL := s.brokerURL()
+	port := m.grantedBuiltinPort()
+	brokerURL := s.brokerURL(port)
 	m.mu.Lock()
 	m.mqttBroker = brokerURL
 	m.mqttError = ""
@@ -1208,11 +1287,19 @@ func (m *module) reconnectMQTT(s Settings) {
 	m.mu.Unlock()
 
 	if s.MQTTBuiltin {
-		port := defaultMQTTPort
+		if port <= 0 {
+			// The module listens only on a port the operator granted.
+			errMsg := "The built-in broker is switched on, but its port is not approved. Approve it on the Ports tab of this extension, then save the connection again."
+			m.mu.Lock()
+			m.mqttError = errMsg
+			m.mu.Unlock()
+			fmt.Fprintf(os.Stderr, "%s: %s\n", logName, errMsg)
+			return
+		}
 		listenAddr := fmt.Sprintf(":%d", port)
 		brk, err := StartEmbeddedBroker(listenAddr, s.MQTTUsername, s.MQTTPassword)
 		if err != nil {
-			errMsg := fmt.Sprintf("Port 1883 is already in use on this host (%v). Another MQTT broker appears to be running — disable the built-in broker and connect to your existing broker instead.", err)
+			errMsg := fmt.Sprintf("Port %d is already in use on this host (%v). Another MQTT broker appears to be running — disable the built-in broker and connect to your existing broker instead.", port, err)
 			m.mu.Lock()
 			m.mqttError = errMsg
 			m.mu.Unlock()
@@ -1327,18 +1414,21 @@ func (m *module) testBroker(override *Settings) (bool, string, string, string) {
 		if candidate.MQTTPassword == "" && candidate.KeepPassword {
 			candidate.MQTTPassword = saved.MQTTPassword
 		}
-		candidate = normalizeSettings(candidate)
+		candidate = m.applyHostPins(candidate)
 	}
 
-	brokerURL := candidate.brokerURL()
+	port := m.grantedBuiltinPort()
+	brokerURL := candidate.brokerURL(port)
 	if brokerURL == "" {
+		if candidate.MQTTBuiltin {
+			return false, "", "The built-in broker's port is not approved. Approve it on the Ports tab of this extension.", ""
+		}
 		return false, "", "Broker host is required", ""
 	}
 
 	dialURL := brokerURL
 	var probeBrk *EmbeddedBroker
 	if candidate.MQTTBuiltin {
-		port := defaultMQTTPort
 		m.mu.RLock()
 		brk := m.embeddedBroker
 		sameRunningPort := brk != nil && brk.Port() == port
@@ -1348,7 +1438,7 @@ func (m *module) testBroker(override *Settings) (bool, string, string, string) {
 		if !sameRunningPort {
 			tmp, err := StartEmbeddedBroker(fmt.Sprintf(":%d", port), candidate.MQTTUsername, candidate.MQTTPassword)
 			if err != nil {
-				return false, brokerURL, fmt.Sprintf("Port 1883 is already in use on this host (%v). Another MQTT broker appears to be running.", err), ""
+				return false, brokerURL, fmt.Sprintf("Port %d is already in use on this host (%v). Another MQTT broker appears to be running.", port, err), ""
 			}
 			defer func() { _ = tmp.Close() }()
 			probeBrk = tmp
@@ -2764,7 +2854,17 @@ type settingsResponse struct {
 	MQTTBuiltinRunning bool     `json:"mqtt_builtin_running"`
 	MQTTBuiltinPort    int      `json:"mqtt_builtin_port,omitempty"`
 	MQTTBuiltinClients int      `json:"mqtt_builtin_clients"`
-	HAConfigured       bool     `json:"ha_configured"`
+	// MQTTBuiltinGranted says whether the operator approved the built-in
+	// broker's port. MQTTBuiltinPort is that port, running or not.
+	MQTTBuiltinGranted bool `json:"mqtt_builtin_granted"`
+	HAConfigured       bool `json:"ha_configured"`
+	// A pinned value was written in the host's own settings for this
+	// extension, and is read-only here.
+	MQTTHostPinned bool `json:"mqtt_host_pinned"`
+	HAURLPinned    bool `json:"ha_url_pinned"`
+	// SuggestedHTTPHost is the http_host option, offered as the address when a
+	// plug is set up by IP address.
+	SuggestedHTTPHost string `json:"suggested_http_host,omitempty"`
 }
 
 func (m *module) buildSettingsResponse() settingsResponse {
@@ -2775,10 +2875,14 @@ func (m *module) buildSettingsResponse() settingsResponse {
 	errMsg := m.mqttError
 	warnMsg := m.mqttWarning
 	brk := m.embeddedBroker
+	grantedPort := m.builtinPort
+	hostPinned := m.pinnedMQTTHost != ""
+	haPinned := m.pinnedHAURL != ""
+	suggestedHTTP := m.suggestedHTTPHost
 	m.mu.RUnlock()
 
 	builtinRunning := brk != nil
-	builtinPort := 0
+	builtinPort := grantedPort
 	builtinClients := 0
 	if brk != nil {
 		builtinPort = brk.Port()
@@ -2795,7 +2899,123 @@ func (m *module) buildSettingsResponse() settingsResponse {
 		MQTTBuiltinRunning: builtinRunning,
 		MQTTBuiltinPort:    builtinPort,
 		MQTTBuiltinClients: builtinClients,
+		MQTTBuiltinGranted: grantedPort > 0,
 		HAConfigured:       s.haConfigured(),
+		MQTTHostPinned:     hostPinned,
+		HAURLPinned:        haPinned,
+		SuggestedHTTPHost:  suggestedHTTP,
+	}
+}
+
+// overviewEntry is one printer's plug in the fleet overview: what a list of
+// every printer shows, without the graph samples and the print history.
+type overviewEntry struct {
+	DeviceID          string            `json:"device_id"`
+	Config            DeviceConfig      `json:"config"`
+	Plug              *PlugTelemetry    `json:"plug,omitempty"`
+	SessionUsage      *PowerSession     `json:"session_usage,omitempty"`
+	CurrentPrintUsage *PrintPowerRecord `json:"current_print_usage,omitempty"`
+}
+
+type overviewResponse struct {
+	Devices            []overviewEntry `json:"devices"`
+	MQTTConfigured     bool            `json:"mqtt_configured"`
+	MQTTConnected      bool            `json:"mqtt_connected"`
+	MQTTError          string          `json:"mqtt_error,omitempty"`
+	HAConfigured       bool            `json:"ha_configured"`
+	DefaultCooldownSec int             `json:"default_cooldown_sec"`
+	ConfirmTurnOff     bool            `json:"confirm_turn_off"`
+	PollIntervalSec    int             `json:"poll_interval_sec"`
+}
+
+// plugSnapshotLocked is the plug a printer's config points at, with the state
+// of the relay that config names. The caller holds m.mu.
+func (m *module) plugSnapshotLocked(cfg DeviceConfig) *PlugTelemetry {
+	key := cfg.plugKey()
+	if key == "" {
+		return nil
+	}
+	if p, ok := m.plugs[key]; ok {
+		cp := p.clone()
+		relayIdx := cfg.relayIndex()
+		cp.Power = cp.relayState(relayIdx)
+		if relayIdx > 1 && len(cp.RelayNames) >= relayIdx && cp.RelayNames[relayIdx-1] != "" {
+			cp.FriendlyName = cp.RelayNames[relayIdx-1]
+		}
+		return &cp
+	}
+	d := cfg.effectiveDriver()
+	friendly := cfg.TasmotaTopic
+	switch d {
+	case DriverTasmotaHTTP, DriverShellyHTTP:
+		friendly = cfg.HTTPHost
+	case DriverHomeAssistant:
+		friendly = cfg.HAEntityID
+	case DriverGenericMQTT:
+		friendly = cfg.MQTTCommandTopic
+	}
+	return &PlugTelemetry{Topic: key, Driver: d, FriendlyName: friendly, Power: "UNKNOWN"}
+}
+
+// buildOverview answers every printer that has a plug or an auto-off setting,
+// kept to the printers visible answers true for. It reads memory only, so one
+// request serves a whole list of printers.
+func (m *module) buildOverview(visible func(deviceID string) bool) overviewResponse {
+	s := m.settings()
+	m.mu.RLock()
+	entries := make([]overviewEntry, 0, len(m.configs))
+	for deviceID, cfg := range m.configs {
+		if !visible(deviceID) {
+			continue
+		}
+		entry := overviewEntry{DeviceID: deviceID, Config: cfg.redacted()}
+		if cfg.configured() {
+			entry.Plug = m.plugSnapshotLocked(cfg)
+			if usage := cloneDeviceUsage(m.usage[deviceID]); usage != nil {
+				entry.SessionUsage = usage.Session
+				entry.CurrentPrintUsage = usage.CurrentPrint
+			}
+		}
+		entries = append(entries, entry)
+	}
+	up := m.mqttUp
+	errMsg := m.mqttError
+	m.mu.RUnlock()
+
+	sort.Slice(entries, func(i, j int) bool { return entries[i].DeviceID < entries[j].DeviceID })
+
+	return overviewResponse{
+		Devices:            entries,
+		MQTTConfigured:     s.mqttConfigured(),
+		MQTTConnected:      up,
+		MQTTError:          errMsg,
+		HAConfigured:       s.haConfigured(),
+		DefaultCooldownSec: s.AutoOffCooldownSec,
+		ConfirmTurnOff:     s.confirmTurnOffEnabled(),
+		PollIntervalSec:    pollIntervalSec,
+	}
+}
+
+// visibleDevices reads the printers principal may see, so a list this module
+// answers never names a printer the caller could not open.
+func (m *module) visibleDevices(ctx context.Context, principal string) (map[string]bool, error) {
+	seen := make(map[string]bool)
+	for offset := 0; ; {
+		page, err := m.devices.List(ctx, deviceapi.ListParams{
+			Principal: principal,
+			Limit:     deviceapi.MaxPageLimit,
+			Offset:    offset,
+		})
+		if err != nil {
+			return nil, err
+		}
+		for _, dev := range page.Items {
+			seen[dev.ID] = true
+		}
+		offset += len(page.Items)
+		if len(page.Items) == 0 || offset >= page.Total {
+			return seen, nil
+		}
 	}
 }
 
@@ -2851,30 +3071,7 @@ func (m *module) buildStatus(ctx context.Context, principal, deviceID string) (s
 	mqttUp := m.mqttUp
 	mqttBroker := m.mqttBroker
 	mqttErr := m.mqttError
-	var plugCopy *PlugTelemetry
-	if key := cfg.plugKey(); key != "" {
-		if p, ok := m.plugs[key]; ok {
-			cp := p.clone()
-			relayIdx := cfg.relayIndex()
-			cp.Power = cp.relayState(relayIdx)
-			if relayIdx > 1 && len(cp.RelayNames) >= relayIdx && cp.RelayNames[relayIdx-1] != "" {
-				cp.FriendlyName = cp.RelayNames[relayIdx-1]
-			}
-			plugCopy = &cp
-		} else {
-			d := cfg.effectiveDriver()
-			friendly := cfg.TasmotaTopic
-			switch d {
-			case DriverTasmotaHTTP, DriverShellyHTTP:
-				friendly = cfg.HTTPHost
-			case DriverHomeAssistant:
-				friendly = cfg.HAEntityID
-			case DriverGenericMQTT:
-				friendly = cfg.MQTTCommandTopic
-			}
-			plugCopy = &PlugTelemetry{Topic: key, Driver: d, FriendlyName: friendly, Power: "UNKNOWN"}
-		}
-	}
+	plugCopy := m.plugSnapshotLocked(cfg)
 	var pending bool
 	var remaining int
 	if cfg.AutoOffAfterPrint {
@@ -2954,7 +3151,7 @@ func (m *module) routes() http.Handler {
 		if body.HAToken == "" && body.KeepHAToken {
 			body.HAToken = current.HAToken
 		}
-		next := normalizeSettings(body)
+		next := m.applyHostPins(body)
 		if err := m.writeSettingsToDisk(next); err != nil {
 			refuse(w, r, InternalError.New(err.Error()))
 			return
@@ -3049,6 +3246,15 @@ func (m *module) routes() http.Handler {
 			"ha_entities":          haEntities,
 			"default_cooldown_sec": s.AutoOffCooldownSec,
 		})
+	})
+
+	mux.HandleFunc("GET /overview", func(w http.ResponseWriter, r *http.Request) {
+		seen, err := m.visibleDevices(r.Context(), routesapi.PrincipalOf(r))
+		if err != nil {
+			refuse(w, r, InternalError.New(err.Error()))
+			return
+		}
+		answer(w, http.StatusOK, m.buildOverview(func(deviceID string) bool { return seen[deviceID] }))
 	})
 
 	mux.HandleFunc("GET /devices/{device_id}", func(w http.ResponseWriter, r *http.Request) {
@@ -3147,7 +3353,7 @@ func (m *module) routes() http.Handler {
 			return
 		}
 		if !cfg.configured() {
-			refuse(w, r, NotConfigured.New("no Tasmota plug configured for this printer"))
+			refuse(w, r, NotConfigured.New("no smart plug is set up for this printer"))
 			return
 		}
 
@@ -3217,7 +3423,7 @@ func (m *module) routes() http.Handler {
 			return
 		}
 		if !cfg.configured() {
-			refuse(w, r, NotConfigured.New("no Tasmota plug configured for this printer"))
+			refuse(w, r, NotConfigured.New("no smart plug is set up for this printer"))
 			return
 		}
 		cfg.AutoOffAfterPrint = body.Enabled

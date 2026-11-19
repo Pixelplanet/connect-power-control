@@ -58,7 +58,7 @@ install: release
 	printf 'core:\n  overlay: %s/resources.json\n  modules: %s/modules\n  authz:\n    database: %s/authz.db\n  api:\n    addr: 127.0.0.1:18480\n' \
 		"$(TRY)" "$(TRY)" "$(TRY)" > $(TRY)/config.yaml
 	go -C $(CORE) run ./cmd/prusa-connect module add "$(MODULE)@$(VERSION)" \
-		-config "$(TRY)/config.yaml" -from "$(CURDIR)/$(RELEASE)" -approve
+		-config "$(TRY)/config.yaml" -from "$(CURDIR)/$(RELEASE)" -approve -approve-listen
 	@echo "Installed $(MODULE)@$(VERSION) in $(TRY)"
 
 clean:

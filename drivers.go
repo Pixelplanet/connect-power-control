@@ -1091,7 +1091,7 @@ func (m *module) testHomeAssistant(ctx context.Context, override *Settings) (boo
 		if candidate.HAToken == "" && candidate.KeepHAToken {
 			candidate.HAToken = saved.HAToken
 		}
-		candidate = normalizeSettings(candidate)
+		candidate = m.applyHostPins(candidate)
 	}
 	base := normalizeBaseURL(candidate.HAURL)
 	if base == "" {
