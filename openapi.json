@@ -2,8 +2,8 @@
   "openapi": "3.1.0",
   "info": {
     "title": "connect-power-control",
-    "version": "0.4.1",
-    "description": "Tasmota MQTT and Direct HTTP smart plug control and monitoring per printer."
+    "version": "0.5.0",
+    "description": "Multi-driver smart plug control and energy monitoring per printer (Tasmota, Shelly Gen1/Gen2+, Zigbee2MQTT, ESPHome, OpenBeken, Generic MQTT, and Home Assistant)."
   },
   "paths": {
     "/settings": {
@@ -36,6 +36,18 @@
         "responses": {
           "200": {
             "description": "MQTT broker test result"
+          }
+        }
+      }
+    },
+    "/ha/test": {
+      "post": {
+        "operationId": "test-ha-connection",
+        "summary": "Test Home Assistant REST connectivity and list switch/power entities",
+        "description": "Tests connecting to the provided (or saved) Home Assistant URL and Long-Lived Access Token via GET /api/ and returns discovered switch, input_boolean, and power sensor entities.",
+        "responses": {
+          "200": {
+            "description": "Home Assistant test result and entity list"
           }
         }
       }

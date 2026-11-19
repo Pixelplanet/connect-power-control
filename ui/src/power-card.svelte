@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from 'svelte';
 
-  import { createApi, type PowerStatus } from './api';
+  import { createApi, isDeviceConfigured, type PowerStatus } from './api';
   import { heldHost } from './host';
 
   interface Props {
@@ -33,7 +33,7 @@
   });
 </script>
 
-{#if (status?.config.tasmota_topic || status?.config.http_host) && status.plug}
+{#if isDeviceConfigured(status?.config) && status?.plug}
   <span class="text-xs text-muted-foreground">
     {#if status.plug.power === 'ON'}
       {#if status.plug.power_watts !== undefined}

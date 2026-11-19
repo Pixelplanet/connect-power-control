@@ -4,6 +4,60 @@ import { OWN_MODULE } from './own-module';
 
 const BASE = `/api/v1/modules/${OWN_MODULE || 'com.github.aux.pixelplanet.connect-power-control'}`;
 
+export type PlugDriver =
+  | 'tasmota'
+  | 'tasmota_http'
+  | 'shelly_gen1'
+  | 'shelly_gen2'
+  | 'shelly_http'
+  | 'zigbee2mqtt'
+  | 'esphome'
+  | 'openbeken'
+  | 'generic_mqtt'
+  | 'homeassistant';
+
+export const PLUG_DRIVER_OPTIONS: Array<{ value: PlugDriver; label: string }> = [
+  { value: 'tasmota', label: 'Tasmota (MQTT)' },
+  { value: 'tasmota_http', label: 'Tasmota (Direct HTTP)' },
+  { value: 'shelly_gen2', label: 'Shelly Gen2 / Plus / Pro (MQTT)' },
+  { value: 'shelly_gen1', label: 'Shelly Gen1 (MQTT)' },
+  { value: 'shelly_http', label: 'Shelly Gen1 / Gen2+ (Direct HTTP)' },
+  { value: 'zigbee2mqtt', label: 'Zigbee2MQTT' },
+  { value: 'esphome', label: 'ESPHome (MQTT)' },
+  { value: 'openbeken', label: 'OpenBeken (MQTT)' },
+  { value: 'generic_mqtt', label: 'Generic MQTT (Custom Topics)' },
+  { value: 'homeassistant', label: 'Home Assistant (REST)' },
+];
+
+export const DRIVER_BADGE_LABELS: Record<PlugDriver, string> = {
+  tasmota: 'Tasmota',
+  tasmota_http: 'Tasmota HTTP',
+  shelly_gen1: 'Shelly Gen1',
+  shelly_gen2: 'Shelly Gen2+',
+  shelly_http: 'Shelly HTTP',
+  zigbee2mqtt: 'Zigbee2MQTT',
+  esphome: 'ESPHome',
+  openbeken: 'OpenBeken',
+  generic_mqtt: 'Generic MQTT',
+  homeassistant: 'Home Assistant',
+};
+
+export interface HAEntity {
+  entity_id: string;
+  friendly_name?: string | undefined;
+  state?: string | undefined;
+  domain?: string | undefined;
+  device_class?: string | undefined;
+  unit?: string | undefined;
+}
+
+export interface HATestResult {
+  ok: boolean;
+  url?: string | undefined;
+  entities?: HAEntity[] | undefined;
+  error?: string | undefined;
+}
+
 export interface TasmotaSettings {
   mqtt_builtin: boolean;
   mqtt_host: string;
@@ -14,6 +68,10 @@ export interface TasmotaSettings {
   has_password: boolean;
   keep_password?: boolean | undefined;
   mqtt_client_id: string;
+  ha_url?: string | undefined;
+  ha_token?: string | undefined;
+  has_ha_token?: boolean | undefined;
+  keep_ha_token?: boolean | undefined;
   auto_off_cooldown_sec: number;
   confirm_turn_off: boolean;
 }
@@ -28,6 +86,7 @@ export interface SettingsResponse {
   mqtt_builtin_running: boolean;
   mqtt_builtin_port?: number | undefined;
   mqtt_builtin_clients: number;
+  ha_configured: boolean;
 }
 
 export interface BrokerTestResult {
@@ -38,20 +97,94 @@ export interface BrokerTestResult {
 }
 
 export interface DeviceConfig {
-  mode?: 'mqtt' | 'http' | '' | undefined;
+  driver?: PlugDriver | '' | undefined;
+  mode?: 'mqtt' | 'http' | 'ha' | '' | undefined;
   tasmota_topic: string;
   http_host?: string | undefined;
   http_user?: string | undefined;
   http_password?: string | undefined;
   has_http_password?: boolean | undefined;
   keep_http_password?: boolean | undefined;
+  mqtt_command_topic?: string | undefined;
+  mqtt_state_topic?: string | undefined;
+  mqtt_availability_topic?: string | undefined;
+  mqtt_payload_on?: string | undefined;
+  mqtt_payload_off?: string | undefined;
+  mqtt_state_on?: string | undefined;
+  mqtt_state_off?: string | undefined;
+  mqtt_state_json_key?: string | undefined;
+  mqtt_power_topic?: string | undefined;
+  mqtt_power_json_key?: string | undefined;
+  ha_entity_id?: string | undefined;
+  ha_power_entity_id?: string | undefined;
   relay_index?: number | undefined;
   auto_off_after_print: boolean;
   cooldown_sec?: number | undefined;
 }
 
+export function effectiveDriver(cfg: DeviceConfig | undefined): PlugDriver | '' {
+  if (!cfg) return '';
+  if (cfg.driver) return cfg.driver;
+  if (cfg.mode === 'http') return 'tasmota_http';
+  if (cfg.ha_entity_id) return 'homeassistant';
+  if (cfg.mqtt_command_topic) return 'generic_mqtt';
+  if (cfg.http_host && !cfg.tasmota_topic) return 'tasmota_http';
+  if (cfg.tasmota_topic) return 'tasmota';
+  return '';
+}
+
+export function isDeviceConfigured(cfg: DeviceConfig | undefined): boolean {
+  if (!cfg) return false;
+  const d = effectiveDriver(cfg);
+  if (!d) return false;
+  switch (d) {
+    case 'tasmota_http':
+    case 'shelly_http':
+      return Boolean(cfg.http_host?.trim());
+    case 'homeassistant':
+      return Boolean(cfg.ha_entity_id?.trim());
+    case 'generic_mqtt':
+      return Boolean(cfg.mqtt_command_topic?.trim());
+    default:
+      return Boolean(cfg.tasmota_topic?.trim());
+  }
+}
+
+export function driverUsesMQTT(driver: PlugDriver | ''): boolean {
+  return (
+    driver === 'tasmota' ||
+    driver === 'shelly_gen1' ||
+    driver === 'shelly_gen2' ||
+    driver === 'zigbee2mqtt' ||
+    driver === 'esphome' ||
+    driver === 'openbeken' ||
+    driver === 'generic_mqtt'
+  );
+}
+
+export function driverUsesHTTP(driver: PlugDriver | ''): boolean {
+  return driver === 'tasmota_http' || driver === 'shelly_http';
+}
+
+export function driverDisplayTarget(cfg: DeviceConfig | undefined): string {
+  if (!cfg) return '';
+  const d = effectiveDriver(cfg);
+  switch (d) {
+    case 'tasmota_http':
+    case 'shelly_http':
+      return cfg.http_host ?? '';
+    case 'homeassistant':
+      return cfg.ha_entity_id ?? '';
+    case 'generic_mqtt':
+      return cfg.mqtt_command_topic ?? '';
+    default:
+      return cfg.tasmota_topic ?? '';
+  }
+}
+
 export interface PlugTelemetry {
   topic?: string;
+  driver?: string;
   friendly_name?: string;
   model?: string;
   relay_count?: number;
@@ -100,6 +233,7 @@ export interface PowerStatus {
   mqtt_connected: boolean;
   mqtt_broker?: string;
   mqtt_error?: string;
+  ha_configured?: boolean;
   config: DeviceConfig;
   plug?: PlugTelemetry;
   discovered_plugs?: PlugTelemetry[];
@@ -126,6 +260,8 @@ export interface AssignmentsResponse {
   mqtt_connected: boolean;
   mqtt_broker?: string;
   mqtt_error?: string;
+  ha_configured?: boolean;
+  ha_entities?: HAEntity[];
   default_cooldown_sec: number;
 }
 
@@ -150,6 +286,15 @@ const opTestBroker: Operation = {
   id: 'test-broker-connection',
   method: 'POST',
   path: `${BASE}/broker/test`,
+  body: 'application/json',
+  response: 'json',
+  anonymous: false,
+};
+
+const opTestHomeAssistant: Operation = {
+  id: 'test-ha-connection',
+  method: 'POST',
+  path: `${BASE}/ha/test`,
   body: 'application/json',
   response: 'json',
   anonymous: false,
@@ -217,6 +362,9 @@ export function createApi(host: Pick<ModuleHost, 'client'>) {
 
     testBroker: (settings?: Partial<TasmotaSettings>) =>
       t.call<BrokerTestResult>(opTestBroker, { body: settings ?? {} }),
+
+    testHomeAssistant: (settings?: Partial<TasmotaSettings>) =>
+      t.call<HATestResult>(opTestHomeAssistant, { body: settings ?? {} }),
 
     discoverPlugs: () =>
       t.call<{ plugs: PlugTelemetry[] }>(opDiscover, {}),

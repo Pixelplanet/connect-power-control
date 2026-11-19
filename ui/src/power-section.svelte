@@ -17,7 +17,17 @@
     Switch,
   } from '@prusa/connect-ui/primitives';
 
-  import { createApi, type PowerSample, type PowerStatus } from './api';
+  import {
+    createApi,
+    DRIVER_BADGE_LABELS,
+    driverDisplayTarget,
+    driverUsesHTTP,
+    driverUsesMQTT,
+    effectiveDriver,
+    isDeviceConfigured,
+    type PowerSample,
+    type PowerStatus,
+  } from './api';
   import { heldHost } from './host';
   import { OWN_MODULE } from './own-module';
 
@@ -36,24 +46,15 @@
   let errorMsg = $state('');
   let confirmingOff = $state(false);
 
-  const isHttpPlug = $derived(
-    Boolean(
-      status &&
-        (status.config.mode === 'http' ||
-          (status.config.http_host && !status.config.tasmota_topic)),
-    ),
-  );
-  const isAssigned = $derived(
-    Boolean(
-      status &&
-        (isHttpPlug ? status.config.http_host : status.config.tasmota_topic),
-    ),
-  );
-  const plugTarget = $derived(
-    status
-      ? isHttpPlug
-        ? (status.config.http_host ?? '')
-        : status.config.tasmota_topic
+  const activeDriver = $derived(effectiveDriver(status?.config));
+  const usesMqtt = $derived(driverUsesMQTT(activeDriver));
+  const isHttpPlug = $derived(driverUsesHTTP(activeDriver));
+  const isHaPlug = $derived(activeDriver === 'homeassistant');
+  const isAssigned = $derived(isDeviceConfigured(status?.config));
+  const plugTarget = $derived(driverDisplayTarget(status?.config));
+  const driverBadgeLabel = $derived(
+    activeDriver && activeDriver !== 'tasmota'
+      ? DRIVER_BADGE_LABELS[activeDriver]
       : '',
   );
 
@@ -221,11 +222,11 @@
             {t('tasmota-power.section.configureLink')}
           </a>
         </div>
-      {:else if !isHttpPlug && !status.mqtt_configured}
+      {:else if usesMqtt && !status.mqtt_configured}
         <p class="text-xs text-muted-foreground">
           {t('tasmota-power.section.brokerUnconfigured')}
         </p>
-      {:else if !isHttpPlug && !status.mqtt_connected}
+      {:else if usesMqtt && !status.mqtt_connected}
         <p class="text-xs text-destructive">
           {#if status.mqtt_error}
             {t('tasmota-power.section.brokerOfflineReason', {
@@ -234,6 +235,10 @@
           {:else}
             {t('tasmota-power.section.brokerOffline')}
           {/if}
+        </p>
+      {:else if isHaPlug && !status.ha_configured}
+        <p class="text-xs text-muted-foreground">
+          {t('tasmota-power.section.haUnconfigured')}
         </p>
       {:else}
         <div class="flex flex-wrap items-center justify-between gap-3">
@@ -257,11 +262,11 @@
             {/if}
 
             <span class="text-xs text-muted-foreground">
-              {status.plug?.friendly_name
+              {status.plug?.friendly_name && status.plug.friendly_name !== plugTarget
                 ? `${status.plug.friendly_name} (${plugTarget})`
                 : plugTarget}
-              {#if isHttpPlug}
-                · {t('tasmota-power.settings.httpBadge')}
+              {#if driverBadgeLabel}
+                · {driverBadgeLabel}
               {/if}
               {#if (status.config.relay_index ?? 1) > 1 || (status.plug?.relay_count ?? 1) > 1}
                 · {t('tasmota-power.section.relayBadge', {
@@ -272,7 +277,7 @@
 
             {#if status.plug?.online === false}
               <span class="text-xs text-destructive">
-                {#if isHttpPlug}
+                {#if isHttpPlug || isHaPlug}
                   {status.plug?.last_error
                     ? t('tasmota-power.section.plugOfflineHintHttp', {
                         reason: status.plug.last_error,

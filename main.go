@@ -34,7 +34,7 @@ import (
 const (
 	name    = "connect-power-control"
 	logName = "connect-power-control"
-	release = extension.Version("0.4.1")
+	release = extension.Version("0.5.0")
 
 	defaultMQTTPort     = 1883
 	defaultMQTTTLSPort  = 8883
@@ -63,6 +63,10 @@ type Settings struct {
 	HasPassword        bool   `json:"has_password"`
 	KeepPassword       bool   `json:"keep_password,omitempty"`
 	MQTTClientID       string `json:"mqtt_client_id"`
+	HAURL              string `json:"ha_url,omitempty"`
+	HAToken            string `json:"ha_token,omitempty"`
+	HasHAToken         bool   `json:"has_ha_token"`
+	KeepHAToken        bool   `json:"keep_ha_token,omitempty"`
 	AutoOffCooldownSec int    `json:"auto_off_cooldown_sec"`
 	ConfirmTurnOff     *bool  `json:"confirm_turn_off"`
 
@@ -129,7 +133,10 @@ func normalizeSettings(s Settings) Settings {
 	if s.ConfirmTurnOff == nil {
 		s.ConfirmTurnOff = boolPtr(true)
 	}
+	s.HAURL = normalizeBaseURL(s.HAURL)
+	s.HAToken = strings.TrimSpace(s.HAToken)
 	s.HasPassword = s.MQTTPassword != ""
+	s.HasHAToken = s.HAToken != ""
 	return s
 }
 
@@ -160,6 +167,10 @@ func (s Settings) mqttConfigured() bool {
 	return s.MQTTBuiltin || strings.TrimSpace(s.MQTTHost) != ""
 }
 
+func (s Settings) haConfigured() bool {
+	return normalizeBaseURL(s.HAURL) != "" && strings.TrimSpace(s.HAToken) != ""
+}
+
 func (s Settings) brokerURL() string {
 	if s.MQTTBuiltin {
 		return fmt.Sprintf("tcp://%s", net.JoinHostPort("127.0.0.1", strconv.Itoa(defaultMQTTPort)))
@@ -188,22 +199,38 @@ func (s Settings) redacted() Settings {
 	out.HasPassword = s.MQTTPassword != ""
 	out.MQTTPassword = ""
 	out.KeepPassword = false
+	out.HasHAToken = s.HAToken != ""
+	out.HAToken = ""
+	out.KeepHAToken = false
 	out.MQTTBroker = ""
 	return out
 }
 
 // DeviceConfig is persisted per printer in configs.json.
 type DeviceConfig struct {
-	Mode              string `json:"mode,omitempty"` // "mqtt" (default) or "http"
-	TasmotaTopic      string `json:"tasmota_topic"`
-	HTTPHost          string `json:"http_host,omitempty"`
-	HTTPUser          string `json:"http_user,omitempty"`
-	HTTPPassword      string `json:"http_password,omitempty"`
-	HasHTTPPassword   bool   `json:"has_http_password,omitempty"`
-	KeepHTTPPassword  bool   `json:"keep_http_password,omitempty"`
-	RelayIndex        int    `json:"relay_index,omitempty"`
-	AutoOffAfterPrint bool   `json:"auto_off_after_print"`
-	CooldownSec       *int   `json:"cooldown_sec,omitempty"`
+	Driver                string `json:"driver,omitempty"` // tasmota, tasmota_http, shelly_gen1, shelly_gen2, shelly_http, zigbee2mqtt, esphome, openbeken, generic_mqtt, homeassistant
+	Mode                  string `json:"mode,omitempty"`   // legacy: "mqtt" or "http"
+	TasmotaTopic          string `json:"tasmota_topic"`
+	HTTPHost              string `json:"http_host,omitempty"`
+	HTTPUser              string `json:"http_user,omitempty"`
+	HTTPPassword          string `json:"http_password,omitempty"`
+	HasHTTPPassword       bool   `json:"has_http_password,omitempty"`
+	KeepHTTPPassword      bool   `json:"keep_http_password,omitempty"`
+	MQTTCommandTopic      string `json:"mqtt_command_topic,omitempty"`
+	MQTTStateTopic        string `json:"mqtt_state_topic,omitempty"`
+	MQTTAvailabilityTopic string `json:"mqtt_availability_topic,omitempty"`
+	MQTTPayloadOn         string `json:"mqtt_payload_on,omitempty"`
+	MQTTPayloadOff        string `json:"mqtt_payload_off,omitempty"`
+	MQTTStateOn           string `json:"mqtt_state_on,omitempty"`
+	MQTTStateOff          string `json:"mqtt_state_off,omitempty"`
+	MQTTStateJSONKey      string `json:"mqtt_state_json_key,omitempty"`
+	MQTTPowerTopic        string `json:"mqtt_power_topic,omitempty"`
+	MQTTPowerJSONKey      string `json:"mqtt_power_json_key,omitempty"`
+	HAEntityID            string `json:"ha_entity_id,omitempty"`
+	HAPowerEntityID       string `json:"ha_power_entity_id,omitempty"`
+	RelayIndex            int    `json:"relay_index,omitempty"`
+	AutoOffAfterPrint     bool   `json:"auto_off_after_print"`
+	CooldownSec           *int   `json:"cooldown_sec,omitempty"`
 }
 
 func (c DeviceConfig) relayIndex() int {
@@ -217,29 +244,72 @@ func (c DeviceConfig) relayIndex() int {
 }
 
 func (c DeviceConfig) isHTTP() bool {
-	mode := strings.ToLower(strings.TrimSpace(c.Mode))
-	if mode == "http" {
-		return true
-	}
-	return mode == "" && normalizeHTTPHost(c.HTTPHost) != "" && normalizeTopic(c.TasmotaTopic) == ""
+	return c.usesHTTP()
 }
 
 func (c DeviceConfig) configured() bool {
-	if c.isHTTP() {
+	switch c.effectiveDriver() {
+	case DriverTasmota:
+		return normalizeTopic(c.TasmotaTopic) != ""
+	case DriverTasmotaHTTP, DriverShellyHTTP:
 		return normalizeHTTPHost(c.HTTPHost) != ""
+	case DriverShellyGen1:
+		return normalizeShellyGen1ID(c.TasmotaTopic) != ""
+	case DriverShellyGen2, DriverESPHome, DriverOpenBeken:
+		return normalizeMQTTPrefix(c.TasmotaTopic) != ""
+	case DriverZigbee2MQTT:
+		return normalizeZ2MTopic(c.TasmotaTopic) != ""
+	case DriverGenericMQTT:
+		return strings.TrimSpace(c.MQTTCommandTopic) != ""
+	case DriverHomeAssistant:
+		return strings.TrimSpace(c.HAEntityID) != ""
+	default:
+		return false
 	}
-	return normalizeTopic(c.TasmotaTopic) != ""
 }
 
 func (c DeviceConfig) plugKey() string {
-	if c.isHTTP() {
-		h := normalizeHTTPHost(c.HTTPHost)
-		if h == "" {
-			return ""
+	switch c.effectiveDriver() {
+	case DriverTasmota:
+		return normalizeTopic(c.TasmotaTopic)
+	case DriverTasmotaHTTP:
+		if h := normalizeHTTPHost(c.HTTPHost); h != "" {
+			return "http:" + strings.ToLower(h)
 		}
-		return "http:" + strings.ToLower(h)
+	case DriverShellyHTTP:
+		if h := normalizeHTTPHost(c.HTTPHost); h != "" {
+			return "shellyhttp:" + strings.ToLower(h)
+		}
+	case DriverShellyGen1:
+		if id := normalizeShellyGen1ID(c.TasmotaTopic); id != "" {
+			return "shelly1:" + id
+		}
+	case DriverShellyGen2:
+		if p := normalizeMQTTPrefix(c.TasmotaTopic); p != "" {
+			return "shelly2:" + p
+		}
+	case DriverZigbee2MQTT:
+		if b := normalizeZ2MTopic(c.TasmotaTopic); b != "" {
+			return "z2m:" + b
+		}
+	case DriverESPHome:
+		if p := normalizeMQTTPrefix(c.TasmotaTopic); p != "" {
+			return "esphome:" + p
+		}
+	case DriverOpenBeken:
+		if p := normalizeMQTTPrefix(c.TasmotaTopic); p != "" {
+			return "openbeken:" + p
+		}
+	case DriverGenericMQTT:
+		if cmd := strings.TrimSpace(c.MQTTCommandTopic); cmd != "" {
+			return "generic:" + cmd
+		}
+	case DriverHomeAssistant:
+		if ent := strings.TrimSpace(c.HAEntityID); ent != "" {
+			return "ha:" + strings.ToLower(ent)
+		}
 	}
-	return normalizeTopic(c.TasmotaTopic)
+	return ""
 }
 
 func (c DeviceConfig) httpBaseURL() string {
@@ -284,9 +354,10 @@ func normalizeHTTPHost(raw string) string {
 	return host
 }
 
-// PlugTelemetry holds live MQTT state for a Tasmota topic.
+// PlugTelemetry holds live state for a smart plug.
 type PlugTelemetry struct {
 	Topic        string         `json:"topic,omitempty"`
+	Driver       string         `json:"driver,omitempty"`
 	FriendlyName string         `json:"friendly_name,omitempty"`
 	Model        string         `json:"model,omitempty"`
 	RelayCount   int            `json:"relay_count,omitempty"`
@@ -612,7 +683,7 @@ func run() error {
 				effective := normalizeSettings(sent)
 				if stored, ok := mod.loadSettingsFromDisk(); ok {
 					effective = stored
-				} else if effective.MQTTHost != "" || effective.MQTTBuiltin {
+				} else if effective.MQTTHost != "" || effective.MQTTBuiltin || effective.HAURL != "" {
 					// Migrate legacy host-passed settings into settings.json once.
 					_ = mod.writeSettingsToDisk(effective)
 				}
@@ -698,6 +769,8 @@ func (m *module) writeSettingsToDisk(s Settings) error {
 	toWrite := s
 	toWrite.HasPassword = false
 	toWrite.KeepPassword = false
+	toWrite.HasHAToken = false
+	toWrite.KeepHAToken = false
 	toWrite.MQTTBroker = ""
 
 	return writeJSONAtomic(filepath.Join(dir, settingsFileName), toWrite)
@@ -743,15 +816,36 @@ func (m *module) loadAllConfigs() {
 	}
 	m.mu.Unlock()
 
+	m.syncDriverSubscriptions()
 	for _, cfg := range loaded {
 		ncfg := normalizeDeviceConfig(cfg)
-		if ncfg.isHTTP() && ncfg.HTTPHost != "" {
-			go func(c DeviceConfig) {
-				_ = m.pollHTTPPlug(context.Background(), c)
-			}(ncfg)
-		} else if ncfg.TasmotaTopic != "" {
-			m.queryPlugState(ncfg.TasmotaTopic)
+		if ncfg.configured() {
+			go m.refreshConfigState(context.Background(), ncfg)
 		}
+	}
+}
+
+func (m *module) refreshConfigState(ctx context.Context, cfg DeviceConfig) {
+	switch cfg.effectiveDriver() {
+	case DriverTasmota:
+		if cfg.TasmotaTopic != "" {
+			m.queryPlugState(cfg.TasmotaTopic)
+		}
+	case DriverTasmotaHTTP:
+		if cfg.HTTPHost != "" {
+			_ = m.pollHTTPPlug(ctx, cfg)
+		}
+	case DriverShellyHTTP:
+		if cfg.HTTPHost != "" {
+			_ = m.pollShellyHTTPPlug(ctx, cfg)
+		}
+	case DriverHomeAssistant:
+		if cfg.HAEntityID != "" {
+			_ = m.pollHomeAssistantPlug(ctx, cfg)
+		}
+	case DriverShellyGen1, DriverShellyGen2, DriverZigbee2MQTT, DriverESPHome, DriverOpenBeken, DriverGenericMQTT:
+		m.syncDriverSubscriptions()
+		m.queryDriverState(cfg)
 	}
 }
 
@@ -866,32 +960,137 @@ func (m *module) getConfig(_ context.Context, deviceID string) (DeviceConfig, er
 }
 
 func normalizeDeviceConfig(cfg DeviceConfig) DeviceConfig {
-	if cfg.isHTTP() {
-		cfg.HTTPHost = normalizeHTTPHost(cfg.HTTPHost)
-		cfg.TasmotaTopic = ""
-		cfg.HTTPUser = strings.TrimSpace(cfg.HTTPUser)
-		if cfg.HTTPHost == "" {
-			cfg.Mode = ""
-			cfg.HTTPUser = ""
-			cfg.HTTPPassword = ""
-		} else {
-			cfg.Mode = "http"
-		}
-	} else {
-		cfg.TasmotaTopic = normalizeTopic(cfg.TasmotaTopic)
+	d := cfg.effectiveDriver()
+
+	clearHTTP := func() {
 		cfg.HTTPHost = ""
 		cfg.HTTPUser = ""
 		cfg.HTTPPassword = ""
+	}
+	clearGeneric := func() {
+		cfg.MQTTCommandTopic = ""
+		cfg.MQTTStateTopic = ""
+		cfg.MQTTAvailabilityTopic = ""
+		cfg.MQTTPayloadOn = ""
+		cfg.MQTTPayloadOff = ""
+		cfg.MQTTStateOn = ""
+		cfg.MQTTStateOff = ""
+		cfg.MQTTStateJSONKey = ""
+		cfg.MQTTPowerTopic = ""
+		cfg.MQTTPowerJSONKey = ""
+	}
+	clearHA := func() {
+		cfg.HAEntityID = ""
+		cfg.HAPowerEntityID = ""
+	}
+
+	switch d {
+	case DriverTasmotaHTTP, DriverShellyHTTP:
+		cfg.HTTPHost = normalizeHTTPHost(cfg.HTTPHost)
+		cfg.HTTPUser = strings.TrimSpace(cfg.HTTPUser)
+		cfg.TasmotaTopic = ""
+		clearGeneric()
+		clearHA()
+		if cfg.HTTPHost == "" {
+			cfg.Driver = ""
+			cfg.Mode = ""
+			clearHTTP()
+		} else {
+			cfg.Driver = d
+			cfg.Mode = "http"
+		}
+	case DriverHomeAssistant:
+		cfg.HAEntityID = strings.TrimSpace(cfg.HAEntityID)
+		cfg.HAPowerEntityID = strings.TrimSpace(cfg.HAPowerEntityID)
+		cfg.TasmotaTopic = ""
+		clearHTTP()
+		clearGeneric()
+		if cfg.HAEntityID == "" {
+			cfg.Driver = ""
+			cfg.Mode = ""
+			clearHA()
+		} else {
+			cfg.Driver = d
+			cfg.Mode = "ha"
+		}
+	case DriverGenericMQTT:
+		cfg.MQTTCommandTopic = strings.TrimSpace(cfg.MQTTCommandTopic)
+		cfg.MQTTStateTopic = strings.TrimSpace(cfg.MQTTStateTopic)
+		cfg.MQTTAvailabilityTopic = strings.TrimSpace(cfg.MQTTAvailabilityTopic)
+		cfg.MQTTPayloadOn = strings.TrimSpace(cfg.MQTTPayloadOn)
+		cfg.MQTTPayloadOff = strings.TrimSpace(cfg.MQTTPayloadOff)
+		cfg.MQTTStateOn = strings.TrimSpace(cfg.MQTTStateOn)
+		cfg.MQTTStateOff = strings.TrimSpace(cfg.MQTTStateOff)
+		cfg.MQTTStateJSONKey = strings.TrimSpace(cfg.MQTTStateJSONKey)
+		cfg.MQTTPowerTopic = strings.TrimSpace(cfg.MQTTPowerTopic)
+		cfg.MQTTPowerJSONKey = strings.TrimSpace(cfg.MQTTPowerJSONKey)
+		cfg.TasmotaTopic = ""
+		clearHTTP()
+		clearHA()
+		if cfg.MQTTCommandTopic == "" {
+			cfg.Driver = ""
+			cfg.Mode = ""
+			clearGeneric()
+		} else {
+			cfg.Driver = d
+			cfg.Mode = "mqtt"
+		}
+	case DriverShellyGen1:
+		cfg.TasmotaTopic = normalizeShellyGen1ID(cfg.TasmotaTopic)
+		clearHTTP()
+		clearGeneric()
+		clearHA()
+		if cfg.TasmotaTopic == "" {
+			cfg.Driver = ""
+			cfg.Mode = ""
+		} else {
+			cfg.Driver = d
+			cfg.Mode = "mqtt"
+		}
+	case DriverZigbee2MQTT:
+		cfg.TasmotaTopic = normalizeZ2MTopic(cfg.TasmotaTopic)
+		clearHTTP()
+		clearGeneric()
+		clearHA()
+		if cfg.TasmotaTopic == "" {
+			cfg.Driver = ""
+			cfg.Mode = ""
+		} else {
+			cfg.Driver = d
+			cfg.Mode = "mqtt"
+		}
+	case DriverShellyGen2, DriverESPHome, DriverOpenBeken:
+		cfg.TasmotaTopic = normalizeMQTTPrefix(cfg.TasmotaTopic)
+		clearHTTP()
+		clearGeneric()
+		clearHA()
+		if cfg.TasmotaTopic == "" {
+			cfg.Driver = ""
+			cfg.Mode = ""
+		} else {
+			cfg.Driver = d
+			cfg.Mode = "mqtt"
+		}
+	default:
+		cfg.TasmotaTopic = normalizeTopic(cfg.TasmotaTopic)
+		clearHTTP()
+		clearGeneric()
+		clearHA()
 		if cfg.TasmotaTopic != "" {
+			cfg.Driver = DriverTasmota
 			cfg.Mode = "mqtt"
 		} else {
+			cfg.Driver = ""
 			cfg.Mode = ""
 		}
 	}
+
 	cfg.HasHTTPPassword = cfg.HTTPPassword != ""
 	cfg.KeepHTTPPassword = false
 	if !cfg.configured() {
 		cfg.RelayIndex = 0
+	} else if cfg.Driver == DriverHomeAssistant || cfg.Driver == DriverGenericMQTT {
+		cfg.RelayIndex = 1
 	} else {
 		cfg.RelayIndex = cfg.relayIndex()
 	}
@@ -903,7 +1102,7 @@ func (m *module) saveConfig(_ context.Context, deviceID string, cfg DeviceConfig
 	cfg = normalizeDeviceConfig(cfg)
 
 	m.mu.Lock()
-	if existing, ok := m.configs[deviceID]; ok && cfg.isHTTP() && cfg.HTTPHost != "" && cfg.HTTPPassword == "" && keepHTTPPw {
+	if existing, ok := m.configs[deviceID]; ok && cfg.usesHTTP() && cfg.HTTPHost != "" && cfg.HTTPPassword == "" && keepHTTPPw {
 		cfg.HTTPPassword = existing.HTTPPassword
 		cfg.HasHTTPPassword = cfg.HTTPPassword != ""
 	}
@@ -924,14 +1123,8 @@ func (m *module) saveConfig(_ context.Context, deviceID string, cfg DeviceConfig
 		}
 	}
 
-	if cfg.isHTTP() {
-		if cfg.HTTPHost != "" {
-			go func(c DeviceConfig) {
-				_ = m.pollHTTPPlug(context.Background(), c)
-			}(cfg)
-		}
-	} else if cfg.TasmotaTopic != "" {
-		m.queryPlugState(cfg.TasmotaTopic)
+	if cfg.configured() {
+		go m.refreshConfigState(context.Background(), cfg)
 	}
 	return nil
 }
@@ -1072,7 +1265,10 @@ func (m *module) reconnectMQTT(s Settings) {
 			c.Subscribe(sub, 0, m.onMQTTMessage)
 		}
 
-		go m.queryAllKnownPlugs()
+		go func() {
+			m.syncDriverSubscriptions()
+			m.queryAllKnownPlugs()
+		}()
 		fmt.Fprintf(os.Stderr, "%s: connected to MQTT broker %s\n", logName, brokerURL)
 	})
 
@@ -1209,17 +1405,40 @@ func (m *module) discoverPlugs() {
 	m.queryAllKnownPlugs()
 }
 
+func isDriverPrefixedKey(topic string) bool {
+	for _, p := range []string{"http:", "shellyhttp:", "shelly1:", "shelly2:", "z2m:", "esphome:", "openbeken:", "generic:", "ha:"} {
+		if strings.HasPrefix(topic, p) {
+			return true
+		}
+	}
+	return false
+}
+
 func (m *module) discoveredListLocked() []PlugTelemetry {
 	out := make([]PlugTelemetry, 0, len(m.plugs))
 	for topic, p := range m.plugs {
-		if strings.HasPrefix(topic, "http:") {
+		// Show auto-discovered Tasmota plugs and Shelly Gen1 plugs in the discovery list.
+		if isDriverPrefixedKey(topic) && !strings.HasPrefix(topic, "shelly1:") {
 			continue
 		}
 		cp := p.clone()
-		cp.Topic = topic
+		if strings.HasPrefix(topic, "shelly1:") {
+			cp.Topic = strings.TrimPrefix(topic, "shelly1:")
+			if cp.Driver == "" {
+				cp.Driver = DriverShellyGen1
+			}
+		} else {
+			cp.Topic = topic
+			if cp.Driver == "" {
+				cp.Driver = DriverTasmota
+			}
+		}
 		out = append(out, cp)
 	}
 	sort.Slice(out, func(i, j int) bool {
+		if out[i].Driver != out[j].Driver {
+			return out[i].Driver < out[j].Driver
+		}
 		return out[i].Topic < out[j].Topic
 	})
 	return out
@@ -1311,7 +1530,11 @@ func (m *module) resolveIncomingTopicLocked(msgTopic string) (plug *PlugTelemetr
 }
 
 func (m *module) onMQTTMessage(c mqtt.Client, msg mqtt.Message) {
-	customSubs, queryTopic := m.handleMQTTPacket(msg.Topic(), msg.Payload(), time.Now())
+	now := time.Now()
+	if m.handleDriverMQTTPacket(msg.Topic(), msg.Payload(), now) {
+		return
+	}
+	customSubs, queryTopic := m.handleMQTTPacket(msg.Topic(), msg.Payload(), now)
 	if c != nil && len(customSubs) > 0 {
 		for _, sub := range customSubs {
 			c.Subscribe(sub, 0, m.onMQTTMessage)
@@ -1610,24 +1833,31 @@ func (m *module) queryAllKnownPlugs() {
 	m.mu.RLock()
 	seen := make(map[string]struct{})
 	var topics []string
+	var driverConfigs []DeviceConfig
 	for topic := range m.plugs {
-		if topic != "" && !strings.HasPrefix(topic, "http:") {
+		if topic != "" && !isDriverPrefixedKey(topic) {
 			seen[topic] = struct{}{}
 			topics = append(topics, topic)
 		}
 	}
 	for _, cfg := range m.configs {
-		if !cfg.isHTTP() && cfg.TasmotaTopic != "" {
+		d := cfg.effectiveDriver()
+		if d == DriverTasmota && cfg.TasmotaTopic != "" {
 			if _, ok := seen[cfg.TasmotaTopic]; !ok {
 				seen[cfg.TasmotaTopic] = struct{}{}
 				topics = append(topics, cfg.TasmotaTopic)
 			}
+		} else if d == DriverShellyGen2 || d == DriverZigbee2MQTT {
+			driverConfigs = append(driverConfigs, cfg)
 		}
 	}
 	m.mu.RUnlock()
 
 	for _, t := range topics {
 		m.queryPlugState(t)
+	}
+	for _, cfg := range driverConfigs {
+		m.queryDriverState(cfg)
 	}
 }
 
@@ -1637,20 +1867,38 @@ func (m *module) pollAssignedPlugsEnergy() {
 	up := m.mqttUp
 	var statusPubs []string
 	var unknownPubs []string
-	var httpConfigs []DeviceConfig
+	var pollConfigs []DeviceConfig
+	var queryDriverConfigs []DeviceConfig
 	seenStatus := make(map[string]struct{})
 	seenUnknown := make(map[string]struct{})
-	seenHTTP := make(map[string]struct{})
+	seenPoll := make(map[string]struct{})
+	seenQuery := make(map[string]struct{})
 	for _, cfg := range m.configs {
 		if !cfg.configured() {
 			continue
 		}
-		if cfg.isHTTP() {
+		d := cfg.effectiveDriver()
+		switch d {
+		case DriverTasmotaHTTP, DriverShellyHTTP, DriverHomeAssistant:
 			key := cfg.plugKey()
-			if _, dup := seenHTTP[key]; !dup {
-				seenHTTP[key] = struct{}{}
-				httpConfigs = append(httpConfigs, cfg)
+			if _, dup := seenPoll[key]; !dup {
+				seenPoll[key] = struct{}{}
+				pollConfigs = append(pollConfigs, cfg)
 			}
+			continue
+		case DriverShellyGen2, DriverZigbee2MQTT:
+			if c != nil && up {
+				key := cfg.plugKey()
+				if _, dup := seenQuery[key]; !dup {
+					seenQuery[key] = struct{}{}
+					queryDriverConfigs = append(queryDriverConfigs, cfg)
+				}
+			}
+			continue
+		case DriverTasmota:
+			// handled below
+		default:
+			// Shelly Gen1, ESPHome, OpenBeken, Generic MQTT push telemetry on MQTT
 			continue
 		}
 		if c == nil || !up {
@@ -1686,13 +1934,23 @@ func (m *module) pollAssignedPlugsEnergy() {
 	for _, pub := range statusPubs {
 		c.Publish(pub, 1, false, "8")
 	}
-	if len(httpConfigs) > 0 {
+	for _, cfg := range queryDriverConfigs {
+		m.queryDriverState(cfg)
+	}
+	if len(pollConfigs) > 0 {
 		var wg sync.WaitGroup
-		for _, cfg := range httpConfigs {
+		for _, cfg := range pollConfigs {
 			wg.Add(1)
-			go func(hc DeviceConfig) {
+			go func(pc DeviceConfig) {
 				defer wg.Done()
-				_ = m.pollHTTPPlug(context.Background(), hc)
+				switch pc.effectiveDriver() {
+				case DriverTasmotaHTTP:
+					_ = m.pollHTTPPlug(context.Background(), pc)
+				case DriverShellyHTTP:
+					_ = m.pollShellyHTTPPlug(context.Background(), pc)
+				case DriverHomeAssistant:
+					_ = m.pollHomeAssistantPlug(context.Background(), pc)
+				}
 			}(cfg)
 		}
 		wg.Wait()
@@ -2018,10 +2276,18 @@ func (m *module) switchHTTPPlugVerified(ctx context.Context, cfg DeviceConfig, r
 }
 
 func (m *module) switchDevicePower(ctx context.Context, cfg DeviceConfig, wantOn bool) error {
-	if cfg.isHTTP() {
+	switch cfg.effectiveDriver() {
+	case DriverTasmotaHTTP:
 		return m.switchHTTPPlugVerified(ctx, cfg, cfg.relayIndex(), wantOn)
+	case DriverShellyHTTP:
+		return m.switchShellyHTTPPlugVerified(ctx, cfg, wantOn)
+	case DriverHomeAssistant:
+		return m.switchHomeAssistantPlugVerified(ctx, cfg, wantOn)
+	case DriverTasmota:
+		return m.switchPlugVerified(ctx, cfg.TasmotaTopic, cfg.relayIndex(), wantOn)
+	default:
+		return m.switchMQTTDriverVerified(ctx, cfg, wantOn)
 	}
-	return m.switchPlugVerified(ctx, cfg.TasmotaTopic, cfg.relayIndex(), wantOn)
 }
 
 // --- Printer Activity & Safety Interlock ---
@@ -2498,6 +2764,7 @@ type settingsResponse struct {
 	MQTTBuiltinRunning bool     `json:"mqtt_builtin_running"`
 	MQTTBuiltinPort    int      `json:"mqtt_builtin_port,omitempty"`
 	MQTTBuiltinClients int      `json:"mqtt_builtin_clients"`
+	HAConfigured       bool     `json:"ha_configured"`
 }
 
 func (m *module) buildSettingsResponse() settingsResponse {
@@ -2528,6 +2795,7 @@ func (m *module) buildSettingsResponse() settingsResponse {
 		MQTTBuiltinRunning: builtinRunning,
 		MQTTBuiltinPort:    builtinPort,
 		MQTTBuiltinClients: builtinClients,
+		HAConfigured:       s.haConfigured(),
 	}
 }
 
@@ -2537,6 +2805,7 @@ type statusResponse struct {
 	MQTTConnected       bool            `json:"mqtt_connected"`
 	MQTTBroker          string          `json:"mqtt_broker,omitempty"`
 	MQTTError           string          `json:"mqtt_error,omitempty"`
+	HAConfigured        bool            `json:"ha_configured"`
 	Config              DeviceConfig    `json:"config"`
 	Plug                *PlugTelemetry  `json:"plug,omitempty"`
 	DiscoveredPlugs     []PlugTelemetry `json:"discovered_plugs,omitempty"`
@@ -2592,10 +2861,18 @@ func (m *module) buildStatus(ctx context.Context, principal, deviceID string) (s
 				cp.FriendlyName = cp.RelayNames[relayIdx-1]
 			}
 			plugCopy = &cp
-		} else if cfg.isHTTP() {
-			plugCopy = &PlugTelemetry{Topic: key, FriendlyName: cfg.HTTPHost, Power: "UNKNOWN"}
 		} else {
-			plugCopy = &PlugTelemetry{Topic: cfg.TasmotaTopic, Power: "UNKNOWN"}
+			d := cfg.effectiveDriver()
+			friendly := cfg.TasmotaTopic
+			switch d {
+			case DriverTasmotaHTTP, DriverShellyHTTP:
+				friendly = cfg.HTTPHost
+			case DriverHomeAssistant:
+				friendly = cfg.HAEntityID
+			case DriverGenericMQTT:
+				friendly = cfg.MQTTCommandTopic
+			}
+			plugCopy = &PlugTelemetry{Topic: key, Driver: d, FriendlyName: friendly, Power: "UNKNOWN"}
 		}
 	}
 	var pending bool
@@ -2636,6 +2913,7 @@ func (m *module) buildStatus(ctx context.Context, principal, deviceID string) (s
 		MQTTConnected:       mqttUp,
 		MQTTBroker:          mqttBroker,
 		MQTTError:           mqttErr,
+		HAConfigured:        s.haConfigured(),
 		Config:              cfg.redacted(),
 		Plug:                plugCopy,
 		DiscoveredPlugs:     discovered,
@@ -2673,6 +2951,9 @@ func (m *module) routes() http.Handler {
 		if body.MQTTPassword == "" && body.KeepPassword {
 			body.MQTTPassword = current.MQTTPassword
 		}
+		if body.HAToken == "" && body.KeepHAToken {
+			body.HAToken = current.HAToken
+		}
 		next := normalizeSettings(body)
 		if err := m.writeSettingsToDisk(next); err != nil {
 			refuse(w, r, InternalError.New(err.Error()))
@@ -2707,8 +2988,31 @@ func (m *module) routes() http.Handler {
 		})
 	})
 
+	mux.HandleFunc("POST /ha/test", func(w http.ResponseWriter, r *http.Request) {
+		var override *Settings
+		if r.Body != nil {
+			raw, err := io.ReadAll(io.LimitReader(r.Body, 16<<10))
+			if err == nil && len(strings.TrimSpace(string(raw))) > 0 {
+				var body Settings
+				if err := json.Unmarshal(raw, &body); err != nil {
+					refuse(w, r, InvalidInput.New(err.Error()))
+					return
+				}
+				override = &body
+			}
+		}
+		ok, haURL, entities, errMsg := m.testHomeAssistant(r.Context(), override)
+		answer(w, http.StatusOK, map[string]any{
+			"ok":       ok,
+			"url":      haURL,
+			"entities": entities,
+			"error":    errMsg,
+		})
+	})
+
 	mux.HandleFunc("POST /discover", func(w http.ResponseWriter, _ *http.Request) {
 		m.discoverPlugs()
+		m.syncDriverSubscriptions()
 		time.Sleep(400 * time.Millisecond)
 		m.mu.RLock()
 		discovered := m.discoveredListLocked()
@@ -2718,7 +3022,7 @@ func (m *module) routes() http.Handler {
 		})
 	})
 
-	mux.HandleFunc("GET /assignments", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /assignments", func(w http.ResponseWriter, r *http.Request) {
 		s := m.settings()
 		m.mu.RLock()
 		configsCopy := make(map[string]DeviceConfig, len(m.configs))
@@ -2730,6 +3034,10 @@ func (m *module) routes() http.Handler {
 		broker := m.mqttBroker
 		errMsg := m.mqttError
 		m.mu.RUnlock()
+		var haEntities []HAEntity
+		if s.haConfigured() {
+			haEntities, _ = m.fetchHAEntities(r.Context(), s)
+		}
 		answer(w, http.StatusOK, map[string]any{
 			"assignments":          configsCopy,
 			"discovered_plugs":     discovered,
@@ -2737,6 +3045,8 @@ func (m *module) routes() http.Handler {
 			"mqtt_connected":       up,
 			"mqtt_broker":          broker,
 			"mqtt_error":           errMsg,
+			"ha_configured":        s.haConfigured(),
+			"ha_entities":          haEntities,
 			"default_cooldown_sec": s.AutoOffCooldownSec,
 		})
 	})
@@ -2761,11 +3071,15 @@ func (m *module) routes() http.Handler {
 			return
 		}
 		mode := strings.ToLower(strings.TrimSpace(body.Mode))
-		if mode != "" && mode != "mqtt" && mode != "http" {
-			refuse(w, r, InvalidInput.New("mode must be mqtt or http"))
+		if mode != "" && mode != "mqtt" && mode != "http" && mode != "ha" {
+			refuse(w, r, InvalidInput.New("mode must be mqtt, http, or ha"))
 			return
 		}
-		if body.isHTTP() && strings.TrimSpace(body.HTTPHost) != "" && normalizeHTTPHost(body.HTTPHost) == "" {
+		if !isValidDriverInput(body.Driver) {
+			refuse(w, r, InvalidInput.New("unsupported plug driver"))
+			return
+		}
+		if body.usesHTTP() && strings.TrimSpace(body.HTTPHost) != "" && normalizeHTTPHost(body.HTTPHost) == "" {
 			refuse(w, r, InvalidInput.New("invalid HTTP plug IP, hostname, or URL"))
 			return
 		}
@@ -2792,9 +3106,16 @@ func (m *module) routes() http.Handler {
 			refuse(w, r, InternalError.New(err.Error()))
 			return
 		}
-		if normalizedCfg.isHTTP() && candidateKey != "" {
+		if candidateKey != "" {
 			savedCfg, _ := m.getConfig(r.Context(), deviceID)
-			_ = m.pollHTTPPlug(r.Context(), savedCfg)
+			switch savedCfg.effectiveDriver() {
+			case DriverTasmotaHTTP:
+				_ = m.pollHTTPPlug(r.Context(), savedCfg)
+			case DriverShellyHTTP:
+				_ = m.pollShellyHTTPPlug(r.Context(), savedCfg)
+			case DriverHomeAssistant:
+				_ = m.pollHomeAssistantPlug(r.Context(), savedCfg)
+			}
 		}
 		resp, err := m.buildStatus(r.Context(), principal, deviceID)
 		if err != nil {
@@ -2868,11 +3189,7 @@ func (m *module) routes() http.Handler {
 
 		go func(c DeviceConfig) {
 			time.Sleep(400 * time.Millisecond)
-			if c.isHTTP() {
-				_ = m.pollHTTPPlug(context.Background(), c)
-			} else {
-				m.queryPlugState(c.TasmotaTopic)
-			}
+			m.refreshConfigState(context.Background(), c)
 		}(cfg)
 
 		resp, err := m.buildStatus(r.Context(), principal, deviceID)

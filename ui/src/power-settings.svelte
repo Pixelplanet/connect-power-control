@@ -11,8 +11,17 @@
 
   import {
     createApi,
+    DRIVER_BADGE_LABELS,
+    driverDisplayTarget,
+    driverUsesHTTP,
+    effectiveDriver,
+    isDeviceConfigured,
+    PLUG_DRIVER_OPTIONS,
     type AssignmentsResponse,
     type BrokerTestResult,
+    type DeviceConfig,
+    type HAEntity,
+    type PlugDriver,
     type PlugTelemetry,
     type SettingsResponse,
   } from './api';
@@ -23,7 +32,7 @@
   const fleet = host.fleet;
   const t = host.t;
 
-  // Broker form state
+  // Broker & General form state
   let mqttBuiltin = $state(false);
   let mqttHost = $state('');
   let mqttPort = $state('1883');
@@ -35,16 +44,39 @@
   let cooldownSec = $state('120');
   let confirmTurnOff = $state(true);
 
+  // Home Assistant form state
+  let haUrl = $state('');
+  let haToken = $state('');
+  let hasSavedHaToken = $state(false);
+  let haEntities = $state<HAEntity[]>([]);
+  let testingHa = $state(false);
+  let haMessage = $state('');
+  let haMessageIsError = $state(false);
+
   let settingsMeta = $state<SettingsResponse | undefined>(undefined);
   let assignmentsData = $state<AssignmentsResponse | undefined>(undefined);
-  let selectedModes = $state<Record<string, 'mqtt' | 'http'>>({});
-  let manualOpen = $state<Record<string, boolean>>({});
-  let selectedTopics = $state<Record<string, string>>({});
-  let selectedRelays = $state<Record<string, number>>({});
-  let manualTopics = $state<Record<string, string>>({});
-  let httpHosts = $state<Record<string, string>>({});
-  let httpPasswords = $state<Record<string, string>>({});
-  let hasHttpPasswords = $state<Record<string, boolean>>({});
+
+  interface DeviceDraft {
+    driver: PlugDriver;
+    topic: string;
+    manual: boolean;
+    relay: number;
+    httpHost: string;
+    httpPassword: string;
+    hasHttpPassword: boolean;
+    mqttCmdTopic: string;
+    mqttStateTopic: string;
+    mqttAvailTopic: string;
+    mqttPayloadOn: string;
+    mqttPayloadOff: string;
+    mqttStateJsonKey: string;
+    mqttPowerTopic: string;
+    mqttPowerJsonKey: string;
+    haEntityId: string;
+    haPowerEntityId: string;
+  }
+
+  let drafts = $state<Record<string, DeviceDraft>>({});
   let justSaved = $state<Record<string, boolean>>({});
 
   let savingSettings = $state(false);
@@ -58,6 +90,12 @@
   let assignmentError = $state('');
 
   const devices = $derived(fleet.devices);
+  const haSwitchEntities = $derived(
+    haEntities.filter((e) => e.domain === 'switch' || e.domain === 'input_boolean'),
+  );
+  const haPowerEntities = $derived(
+    haEntities.filter((e) => e.domain === 'sensor'),
+  );
 
   function defaultLanHost(): string {
     if (typeof window !== 'undefined' && window.location.hostname) {
@@ -87,6 +125,9 @@
       mqtt_password: mqttPassword,
       keep_password: mqttPassword === '' && hasSavedPassword,
       mqtt_client_id: mqttClientId.trim() || 'prusa-connect-tasmota',
+      ha_url: haUrl.trim(),
+      ha_token: haToken.trim(),
+      keep_ha_token: haToken.trim() === '' && hasSavedHaToken,
       auto_off_cooldown_sec:
         Number.isFinite(parsedCooldown) && parsedCooldown >= 0
           ? parsedCooldown
@@ -107,14 +148,34 @@
     mqttPassword = '';
     hasSavedPassword = res.settings.has_password;
     mqttClientId = res.settings.mqtt_client_id || 'prusa-connect-tasmota';
+    haUrl = res.settings.ha_url ?? '';
+    haToken = '';
+    hasSavedHaToken = Boolean(res.settings.has_ha_token);
     cooldownSec = String(res.settings.auto_off_cooldown_sec ?? 120);
     confirmTurnOff = res.settings.confirm_turn_off ?? true;
   }
 
-  function normalizeHttpHostDraft(raw: string): string {
-    let s = raw.trim().toLowerCase();
-    s = s.replace(/^http:\/\//, '').replace(/\/.*$/, '');
-    return s;
+  function makeDraftFromConfig(cfg: DeviceConfig | undefined): DeviceDraft {
+    const drv = effectiveDriver(cfg) || 'tasmota';
+    return {
+      driver: drv,
+      topic: cfg?.tasmota_topic ?? '',
+      manual: false,
+      relay: cfg?.relay_index || 1,
+      httpHost: cfg?.http_host ?? '',
+      httpPassword: '',
+      hasHttpPassword: Boolean(cfg?.has_http_password),
+      mqttCmdTopic: cfg?.mqtt_command_topic ?? '',
+      mqttStateTopic: cfg?.mqtt_state_topic ?? '',
+      mqttAvailTopic: cfg?.mqtt_availability_topic ?? '',
+      mqttPayloadOn: cfg?.mqtt_payload_on ?? '',
+      mqttPayloadOff: cfg?.mqtt_payload_off ?? '',
+      mqttStateJsonKey: cfg?.mqtt_state_json_key ?? '',
+      mqttPowerTopic: cfg?.mqtt_power_topic ?? '',
+      mqttPowerJsonKey: cfg?.mqtt_power_json_key ?? '',
+      haEntityId: cfg?.ha_entity_id ?? '',
+      haPowerEntityId: cfg?.ha_power_entity_id ?? '',
+    };
   }
 
   function syncAssignmentDrafts(
@@ -122,44 +183,36 @@
     preserveDrafts = false,
   ) {
     assignmentsData = aRes;
-    const nextModes: Record<string, 'mqtt' | 'http'> = {};
-    const nextSelected: Record<string, string> = {};
-    const nextRelays: Record<string, number> = {};
-    const nextManual: Record<string, string> = {};
-    const nextHttpHosts: Record<string, string> = {};
-    const nextHttpPasswords: Record<string, string> = {};
-    const nextHasHttpPasswords: Record<string, boolean> = {};
+    if (aRes.ha_entities && aRes.ha_entities.length > 0) {
+      haEntities = aRes.ha_entities;
+    }
+    const nextDrafts: Record<string, DeviceDraft> = {};
     for (const dev of devices) {
       const cfg = aRes.assignments[dev.id];
-      const topic = cfg?.tasmota_topic ?? '';
-      const httpHost = cfg?.http_host ?? '';
-      const isHttp = cfg?.mode === 'http' || (Boolean(httpHost) && !topic);
-      const existingMode = selectedModes[dev.id];
-      if (preserveDrafts && existingMode !== undefined) {
-        nextModes[dev.id] = existingMode;
-        nextSelected[dev.id] = selectedTopics[dev.id] ?? topic;
-        nextRelays[dev.id] = selectedRelays[dev.id] || (cfg?.relay_index || 1);
-        nextManual[dev.id] = manualTopics[dev.id] ?? topic;
-        nextHttpHosts[dev.id] = httpHosts[dev.id] ?? httpHost;
-        nextHttpPasswords[dev.id] = httpPasswords[dev.id] ?? '';
-        nextHasHttpPasswords[dev.id] = Boolean(cfg?.has_http_password);
-        continue;
+      const existing = drafts[dev.id];
+      if (preserveDrafts && existing !== undefined) {
+        nextDrafts[dev.id] = {
+          ...existing,
+          hasHttpPassword: Boolean(cfg?.has_http_password),
+        };
+      } else {
+        nextDrafts[dev.id] = makeDraftFromConfig(cfg);
       }
-      nextModes[dev.id] = isHttp ? 'http' : 'mqtt';
-      nextSelected[dev.id] = topic;
-      nextRelays[dev.id] = cfg?.relay_index || 1;
-      nextManual[dev.id] = topic;
-      nextHttpHosts[dev.id] = httpHost;
-      nextHttpPasswords[dev.id] = '';
-      nextHasHttpPasswords[dev.id] = Boolean(cfg?.has_http_password);
     }
-    selectedModes = nextModes;
-    selectedTopics = nextSelected;
-    selectedRelays = nextRelays;
-    manualTopics = nextManual;
-    httpHosts = nextHttpHosts;
-    httpPasswords = nextHttpPasswords;
-    hasHttpPasswords = nextHasHttpPasswords;
+    drafts = nextDrafts;
+  }
+
+  function getDraft(deviceId: string): DeviceDraft {
+    const existing = drafts[deviceId];
+    if (existing) return existing;
+    return makeDraftFromConfig(assignmentsData?.assignments[deviceId]);
+  }
+
+  function updateDraft(deviceId: string, patch: Partial<DeviceDraft>) {
+    drafts[deviceId] = {
+      ...getDraft(deviceId),
+      ...patch,
+    };
   }
 
   async function refreshAll() {
@@ -220,10 +273,39 @@
     }
   }
 
-  async function handleSaveSettings(event: SubmitEvent) {
-    event.preventDefault();
+  async function handleTestHa() {
+    testingHa = true;
+    haMessage = '';
+    try {
+      const res = await api.testHomeAssistant(buildSettingsPayload());
+      if (res.ok) {
+        if (res.entities) {
+          haEntities = res.entities;
+        }
+        haMessage = t('tasmota-power.settings.haTestOk', {
+          url: res.url ?? haUrl.trim(),
+          count: String(res.entities?.length ?? 0),
+        });
+        haMessageIsError = false;
+      } else {
+        haMessage = t('tasmota-power.settings.testFail', {
+          error: res.error ?? 'unknown error',
+        });
+        haMessageIsError = true;
+      }
+    } catch (err) {
+      haMessage = err instanceof Error ? err.message : String(err);
+      haMessageIsError = true;
+    } finally {
+      testingHa = false;
+    }
+  }
+
+  async function handleSaveSettings(event?: SubmitEvent) {
+    event?.preventDefault();
     savingSettings = true;
     settingsMessage = '';
+    haMessage = '';
     testResult = undefined;
     try {
       const res = await api.saveSettings(buildSettingsPayload());
@@ -257,7 +339,23 @@
     }
   }
 
+  function discoveredForDriver(driver: PlugDriver): PlugTelemetry[] {
+    const all = assignmentsData?.discovered_plugs ?? [];
+    if (driver === 'shelly_gen1') {
+      return all.filter((p) => p.driver === 'shelly_gen1');
+    }
+    if (driver === 'tasmota') {
+      return all.filter((p) => !p.driver || p.driver === 'tasmota');
+    }
+    return [];
+  }
+
+  function plugByTopic(driver: PlugDriver, topic: string): PlugTelemetry | undefined {
+    return discoveredForDriver(driver).find((p) => p.topic === topic);
+  }
+
   function ownerOfTopic(
+    driver: PlugDriver,
     topic: string,
     relayIndex: number,
     excludeDeviceId: string,
@@ -267,6 +365,7 @@
     for (const [devId, cfg] of Object.entries(assignmentsData.assignments)) {
       if (
         devId !== excludeDeviceId &&
+        effectiveDriver(cfg) === driver &&
         cfg.tasmota_topic === topic &&
         (cfg.relay_index || 1) === targetRelay
       ) {
@@ -277,15 +376,15 @@
     return undefined;
   }
 
-  function plugByTopic(topic: string): PlugTelemetry | undefined {
-    return assignmentsData?.discovered_plugs?.find((p) => p.topic === topic);
-  }
-
-  function plugHasFreeRelay(plug: PlugTelemetry, excludeDeviceId: string): boolean {
+  function plugHasFreeRelay(
+    driver: PlugDriver,
+    plug: PlugTelemetry,
+    excludeDeviceId: string,
+  ): boolean {
     if (!plug.topic) return true;
     const count = Math.max(1, plug.relay_count ?? 1);
     for (let r = 1; r <= count; r++) {
-      if (!ownerOfTopic(plug.topic, r, excludeDeviceId)) {
+      if (!ownerOfTopic(driver, plug.topic, r, excludeDeviceId)) {
         return true;
       }
     }
@@ -293,31 +392,30 @@
   }
 
   function firstFreeRelay(
+    driver: PlugDriver,
     plug: PlugTelemetry | undefined,
     excludeDeviceId: string,
   ): number {
     if (!plug?.topic) return 1;
     const count = Math.max(1, plug.relay_count ?? 1);
     for (let r = 1; r <= count; r++) {
-      if (!ownerOfTopic(plug.topic, r, excludeDeviceId)) {
+      if (!ownerOfTopic(driver, plug.topic, r, excludeDeviceId)) {
         return r;
       }
     }
     return 1;
   }
 
-  function relayDisplayState(
-    plug: PlugTelemetry | undefined,
-    relayIndex: number,
+  function plugLabel(
+    driver: PlugDriver,
+    plug: PlugTelemetry,
+    currentDeviceId: string,
   ): string {
-    if (!plug) return 'UNKNOWN';
-    if (plug.online === false) return 'Offline';
-    return plug.relays?.[String(relayIndex)] ?? plug.power;
-  }
-
-  function plugLabel(plug: PlugTelemetry, currentDeviceId: string): string {
     const topic = plug.topic ?? '';
-    const base = plug.friendly_name ? `${plug.friendly_name} (${topic})` : topic;
+    const base =
+      plug.friendly_name && plug.friendly_name !== topic
+        ? `${plug.friendly_name} (${topic})`
+        : topic;
     const relaysCount = Math.max(1, plug.relay_count ?? 1);
     const stateText =
       plug.online === false
@@ -330,8 +428,8 @@
         ? ` · ${Math.round(plug.power_watts)} W`
         : '';
     let inUse = '';
-    if (!plugHasFreeRelay(plug, currentDeviceId)) {
-      const owner = ownerOfTopic(topic, 1, currentDeviceId);
+    if (!plugHasFreeRelay(driver, plug, currentDeviceId)) {
+      const owner = ownerOfTopic(driver, topic, 1, currentDeviceId);
       if (owner) {
         inUse = ` ${t('tasmota-power.settings.inUseBy', { printer: owner })}`;
       }
@@ -339,39 +437,91 @@
     return `${base} · ${stateText}${watts}${inUse}`;
   }
 
-  function ownerOfHttp(
-    host: string,
-    relayIndex: number,
-    excludeDeviceId: string,
-  ): string | undefined {
-    const clean = normalizeHttpHostDraft(host);
-    if (!clean || !assignmentsData) return undefined;
-    const targetRelay = relayIndex || 1;
-    for (const [devId, cfg] of Object.entries(assignmentsData.assignments)) {
-      if (
-        devId !== excludeDeviceId &&
-        cfg.mode === 'http' &&
-        normalizeHttpHostDraft(cfg.http_host ?? '') === clean &&
-        (cfg.relay_index || 1) === targetRelay
-      ) {
-        const dev = fleet.device(devId);
-        return dev?.name || devId;
-      }
+  function draftCanSave(draft: DeviceDraft): boolean {
+    switch (draft.driver) {
+      case 'tasmota_http':
+      case 'shelly_http':
+        return draft.httpHost.trim() !== '';
+      case 'homeassistant':
+        return draft.haEntityId.trim() !== '';
+      case 'generic_mqtt':
+        return draft.mqttCmdTopic.trim() !== '';
+      default:
+        return draft.topic.trim() !== '';
     }
-    return undefined;
   }
 
-  async function saveDeviceAssignment(
-    deviceId: string,
-    config: Parameters<typeof api.saveConfig>[1],
-  ) {
+  function driverSupportsMultiRelay(driver: PlugDriver): boolean {
+    return (
+      driver === 'tasmota' ||
+      driver === 'tasmota_http' ||
+      driver === 'shelly_gen1' ||
+      driver === 'shelly_gen2' ||
+      driver === 'shelly_http' ||
+      driver === 'zigbee2mqtt' ||
+      driver === 'openbeken'
+    );
+  }
+
+  function topicPlaceholderForDriver(driver: PlugDriver): string {
+    switch (driver) {
+      case 'shelly_gen1':
+        return t('tasmota-power.settings.shellyGen1Placeholder');
+      case 'shelly_gen2':
+        return t('tasmota-power.settings.shellyGen2Placeholder');
+      case 'zigbee2mqtt':
+        return t('tasmota-power.settings.z2mPlaceholder');
+      case 'esphome':
+        return t('tasmota-power.settings.esphomePlaceholder');
+      case 'openbeken':
+        return t('tasmota-power.settings.openbekenPlaceholder');
+      default:
+        return t('tasmota-power.settings.manualPlaceholder');
+    }
+  }
+
+  async function saveDeviceDraft(deviceId: string) {
+    const existing = assignmentsData?.assignments[deviceId];
+    const d = getDraft(deviceId);
+    const body: DeviceConfig = {
+      driver: d.driver,
+      tasmota_topic: '',
+      auto_off_after_print: existing?.auto_off_after_print ?? false,
+      cooldown_sec: existing?.cooldown_sec,
+    };
+
+    if (driverUsesHTTP(d.driver)) {
+      body.mode = 'http';
+      body.http_host = d.httpHost.trim();
+      body.http_password = d.httpPassword;
+      body.keep_http_password = d.httpPassword === '' && d.hasHttpPassword;
+      body.relay_index = d.relay;
+    } else if (d.driver === 'homeassistant') {
+      body.mode = 'ha';
+      body.ha_entity_id = d.haEntityId.trim();
+      body.ha_power_entity_id = d.haPowerEntityId.trim();
+    } else if (d.driver === 'generic_mqtt') {
+      body.mode = 'mqtt';
+      body.mqtt_command_topic = d.mqttCmdTopic.trim();
+      body.mqtt_state_topic = d.mqttStateTopic.trim();
+      body.mqtt_availability_topic = d.mqttAvailTopic.trim();
+      body.mqtt_payload_on = d.mqttPayloadOn.trim();
+      body.mqtt_payload_off = d.mqttPayloadOff.trim();
+      body.mqtt_state_json_key = d.mqttStateJsonKey.trim();
+      body.mqtt_power_topic = d.mqttPowerTopic.trim();
+      body.mqtt_power_json_key = d.mqttPowerJsonKey.trim();
+    } else {
+      body.mode = 'mqtt';
+      body.tasmota_topic = d.topic.trim();
+      body.relay_index = d.relay;
+    }
+
     savingDeviceId = deviceId;
     assignmentError = '';
     justSaved[deviceId] = false;
     try {
-      await api.saveConfig(deviceId, config);
+      await api.saveConfig(deviceId, body);
       syncAssignmentDrafts(await api.getAssignments());
-      manualOpen[deviceId] = false;
       justSaved[deviceId] = true;
       setTimeout(() => {
         justSaved[deviceId] = false;
@@ -383,50 +533,40 @@
     }
   }
 
-  async function assignTopic(deviceId: string, topic: string, relayIndex = 1) {
-    const existing = assignmentsData?.assignments[deviceId];
-    const cleanTopic = topic.trim();
-    await saveDeviceAssignment(deviceId, {
-      mode: cleanTopic ? 'mqtt' : '',
-      tasmota_topic: cleanTopic,
-      relay_index: cleanTopic ? relayIndex : undefined,
-      auto_off_after_print: existing?.auto_off_after_print ?? false,
-      cooldown_sec: existing?.cooldown_sec,
-    });
-  }
-
-  async function assignHttp(deviceId: string, relayIndex = 1) {
-    const existing = assignmentsData?.assignments[deviceId];
-    const cleanHost = (httpHosts[deviceId] ?? '').trim();
-    const pw = httpPasswords[deviceId] ?? '';
-    await saveDeviceAssignment(deviceId, {
-      mode: cleanHost ? 'http' : '',
-      tasmota_topic: '',
-      http_host: cleanHost,
-      http_password: pw,
-      keep_http_password: pw === '' && Boolean(hasHttpPasswords[deviceId]),
-      relay_index: cleanHost ? relayIndex : undefined,
-      auto_off_after_print: existing?.auto_off_after_print ?? false,
-      cooldown_sec: existing?.cooldown_sec,
-    });
-  }
-
   async function unassignDevice(deviceId: string) {
     const existing = assignmentsData?.assignments[deviceId];
-    await saveDeviceAssignment(deviceId, {
-      mode: '',
-      tasmota_topic: '',
-      http_host: '',
-      http_password: '',
-      keep_http_password: false,
-      auto_off_after_print: existing?.auto_off_after_print ?? false,
-      cooldown_sec: existing?.cooldown_sec,
-    });
+    savingDeviceId = deviceId;
+    assignmentError = '';
+    justSaved[deviceId] = false;
+    try {
+      await api.saveConfig(deviceId, {
+        driver: '',
+        mode: '',
+        tasmota_topic: '',
+        http_host: '',
+        http_password: '',
+        keep_http_password: false,
+        ha_entity_id: '',
+        ha_power_entity_id: '',
+        mqtt_command_topic: '',
+        auto_off_after_print: existing?.auto_off_after_print ?? false,
+        cooldown_sec: existing?.cooldown_sec,
+      });
+      syncAssignmentDrafts(await api.getAssignments());
+      justSaved[deviceId] = true;
+      setTimeout(() => {
+        justSaved[deviceId] = false;
+      }, 3000);
+    } catch (err) {
+      assignmentError = err instanceof Error ? err.message : String(err);
+    } finally {
+      savingDeviceId = '';
+    }
   }
 </script>
 
 <div class="flex flex-col gap-6">
-  <!-- Pane 1: Unified MQTT Broker Configuration & Connection Test -->
+  <!-- Pane 1: Unified MQTT Broker & General Configuration -->
   <form onsubmit={(e) => void handleSaveSettings(e)}>
     <SettingsPane
       title={t('tasmota-power.settings.mqttTitle')}
@@ -490,7 +630,7 @@
           />
         </div>
 
-        <!-- Row 1: Host | Port | TLS (external broker only; built-in broker is hardwired to port 1883) -->
+        <!-- Row 1: Host | Port | TLS -->
         {#if !mqttBuiltin}
           <div class="grid grid-cols-1 gap-3 sm:grid-cols-12 sm:items-end">
             <div class="sm:col-span-7 flex flex-col gap-1.5">
@@ -570,7 +710,7 @@
           </div>
         </div>
 
-        <!-- Row 3: Cooldown & Client ID inline with explanations -->
+        <!-- Row 3: Cooldown & Client ID -->
         <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <div class="flex flex-col gap-1.5">
             <Label for="mqtt-cooldown">
@@ -623,7 +763,6 @@
           />
         </div>
 
-        <!-- Green / Red Test or Save Feedback Banner -->
         {#if settingsMessage}
           <div
             role={settingsMessageIsError ? 'alert' : 'status'}
@@ -673,7 +812,101 @@
     </SettingsPane>
   </form>
 
-  <!-- Pane 2: Printer <-> Tasmota Plug Assignments -->
+  <!-- Pane 2: Optional Home Assistant REST Integration -->
+  <SettingsPane
+    title={t('tasmota-power.settings.haTitle')}
+    description={t('tasmota-power.settings.haDescription')}
+    edged
+  >
+    <div class="flex flex-col gap-4">
+      <div class="flex flex-wrap items-center gap-2 rounded-sm border border-border bg-background/50 px-3 py-2 text-xs">
+        {#if settingsMeta?.ha_configured}
+          <Badge variant="success">
+            {t('tasmota-power.settings.haConfigured')}
+          </Badge>
+          <span class="text-muted-foreground font-mono">
+            {settingsMeta.settings.ha_url}
+          </span>
+        {:else}
+          <Badge variant="outline">
+            {t('tasmota-power.settings.haNotConfigured')}
+          </Badge>
+        {/if}
+      </div>
+
+      <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <div class="flex flex-col gap-1.5">
+          <Label for="ha-url">
+            {t('tasmota-power.settings.haUrlLabel')}
+          </Label>
+          <Input
+            id="ha-url"
+            type="text"
+            placeholder={t('tasmota-power.settings.haUrlPlaceholder')}
+            value={haUrl}
+            oninput={(e: Event) =>
+              (haUrl = (e.currentTarget as HTMLInputElement).value)}
+          />
+        </div>
+
+        <div class="flex flex-col gap-1.5">
+          <Label for="ha-token">
+            {t('tasmota-power.settings.haTokenLabel')}
+          </Label>
+          <Input
+            id="ha-token"
+            type="password"
+            placeholder={hasSavedHaToken
+              ? t('tasmota-power.settings.haTokenSaved')
+              : t('tasmota-power.settings.haTokenPlaceholder')}
+            value={haToken}
+            oninput={(e: Event) =>
+              (haToken = (e.currentTarget as HTMLInputElement).value)}
+          />
+        </div>
+      </div>
+
+      {#if haMessage}
+        <div
+          role={haMessageIsError ? 'alert' : 'status'}
+          class={[
+            'rounded-sm border px-3 py-2 text-xs font-medium',
+            haMessageIsError
+              ? 'border-destructive bg-destructive/15 text-red-600 dark:text-red-400'
+              : 'border-success bg-success/15 text-emerald-700 dark:text-emerald-400',
+          ]}
+        >
+          {haMessageIsError ? '✕ ' : '✓ '}
+          {haMessage}
+        </div>
+      {/if}
+    </div>
+
+    {#snippet actions()}
+      <Button
+        type="button"
+        variant="secondary"
+        disabled={testingHa || savingSettings || !haUrl.trim() || (!haToken.trim() && !hasSavedHaToken)}
+        onclick={() => void handleTestHa()}
+      >
+        {testingHa
+          ? t('tasmota-power.settings.testing')
+          : t('tasmota-power.settings.haTestButton')}
+      </Button>
+      <Button
+        type="button"
+        variant="default"
+        disabled={savingSettings || testingHa}
+        onclick={() => void handleSaveSettings()}
+      >
+        {savingSettings
+          ? t('tasmota-power.settings.saving')
+          : t('tasmota-power.settings.saveButton')}
+      </Button>
+    {/snippet}
+  </SettingsPane>
+
+  <!-- Pane 3: Printer <-> Smart Plug Assignments -->
   <SettingsPane
     title={t('tasmota-power.settings.assignmentsTitle')}
     description={t('tasmota-power.settings.assignmentsDescription')}
@@ -685,7 +918,7 @@
       <div class="flex flex-wrap items-center justify-between gap-2">
         <span class="text-xs text-muted-foreground">
           {t('tasmota-power.settings.discoveredCount', {
-            count: assignmentsData?.discovered_plugs?.length ?? 0,
+            count: String(assignmentsData?.discovered_plugs?.length ?? 0),
           })}
         </span>
         <Button
@@ -709,294 +942,66 @@
         <div class="flex flex-col gap-3">
           {#each devices as dev (dev.id)}
             {@const currentCfg = assignmentsData?.assignments[dev.id]}
-            {@const currentTopic = currentCfg?.tasmota_topic ?? ''}
-            {@const currentHttpHost = currentCfg?.http_host ?? ''}
-            {@const isCurrentHttp =
-              Boolean(currentHttpHost) &&
-              (currentCfg?.mode === 'http' || !currentTopic)}
-            {@const isCurrentAssigned = Boolean(
-              isCurrentHttp ? currentHttpHost : currentTopic,
-            )}
+            {@const currentDriver = effectiveDriver(currentCfg)}
+            {@const isCurrentAssigned = isDeviceConfigured(currentCfg)}
+            {@const currentTarget = driverDisplayTarget(currentCfg)}
             {@const currentRelay = currentCfg?.relay_index || 1}
-            {@const draftMode =
-              selectedModes[dev.id] ?? (isCurrentHttp ? 'http' : 'mqtt')}
-            {@const isHttpMode = draftMode === 'http'}
-            {@const draftTopic = selectedTopics[dev.id] ?? currentTopic}
-            {@const draftRelay = selectedRelays[dev.id] || 1}
-            {@const draftHttpHost = (httpHosts[dev.id] ?? '').trim()}
-            {@const draftHttpPw = httpPasswords[dev.id] ?? ''}
-            {@const assignedPlug =
-              !isCurrentHttp && currentTopic
-                ? plugByTopic(currentTopic)
-                : undefined}
-            {@const hasDiscovered =
-              (assignmentsData?.discovered_plugs?.length ?? 0) > 0}
-            {@const showManual = manualOpen[dev.id] || !hasDiscovered}
-            {@const draftPlug = showManual
-              ? plugByTopic((manualTopics[dev.id] ?? '').trim())
-              : plugByTopic(draftTopic)}
+            {@const draft = getDraft(dev.id)}
+            {@const discList = discoveredForDriver(draft.driver)}
+            {@const hasDisc = discList.length > 0}
+            {@const useDiscSelect =
+              (draft.driver === 'tasmota' || draft.driver === 'shelly_gen1') &&
+              hasDisc &&
+              !draft.manual}
+            {@const draftPlug = plugByTopic(draft.driver, draft.topic.trim())}
+            {@const showRelay =
+              driverSupportsMultiRelay(draft.driver) && draftCanSave(draft)}
             {@const relayCount = Math.max(
-              isHttpMode || showManual ? 4 : 1,
+              4,
               draftPlug?.relay_count ?? 1,
-              draftRelay,
+              draft.relay,
             )}
-            {@const showRelaySelect = isHttpMode
-              ? draftHttpHost !== ''
-              : (showManual && (manualTopics[dev.id] ?? '').trim() !== '') ||
-                (draftTopic !== '' && (draftPlug?.relay_count ?? 1) > 1) ||
-                currentRelay > 1}
             {@const busy = savingDeviceId === dev.id}
-            {@const httpConflict =
-              isHttpMode && draftHttpHost !== ''
-                ? ownerOfHttp(draftHttpHost, draftRelay, dev.id)
-                : undefined}
-            {@const isDirty = isHttpMode
-              ? draftHttpHost !== '' &&
-                (!isCurrentHttp ||
-                  normalizeHttpHostDraft(draftHttpHost) !==
-                    normalizeHttpHostDraft(currentHttpHost) ||
-                  draftRelay !== currentRelay ||
-                  draftHttpPw !== '')
-              : showManual
-                ? ((manualTopics[dev.id] ?? currentTopic).trim() !==
-                    currentTopic ||
-                    (isCurrentHttp &&
-                      (manualTopics[dev.id] ?? '').trim() !== '') ||
-                    (currentTopic !== '' && draftRelay !== currentRelay))
-                : draftTopic !== currentTopic ||
-                  (isCurrentHttp && draftTopic !== '') ||
-                  (draftTopic !== '' && draftRelay !== currentRelay)}
 
             <div class="flex flex-col gap-3 rounded-sm border border-border bg-background/40 p-3">
-              <div class="flex flex-col gap-2 lg:flex-row lg:items-center lg:justify-between">
-                <div class="flex flex-col gap-1 min-w-0">
-                  <div class="flex flex-wrap items-center gap-2">
-                    <span class="text-sm font-semibold truncate">
-                      {dev.name || dev.id}
-                    </span>
-                    <Badge variant="outline">{dev.model ?? 'Printer'}</Badge>
-                    {#if isCurrentHttp && currentHttpHost}
-                      <Badge variant="secondary">
-                        {t('tasmota-power.settings.httpBadge')} · {currentHttpHost}
-                        {#if currentRelay > 1}
-                          · {t('tasmota-power.section.relayBadge', {
-                            relay: currentRelay,
-                          })}
-                        {/if}
-                      </Badge>
-                    {:else if currentTopic}
-                      {@const curRelayState = relayDisplayState(
-                        assignedPlug,
-                        currentRelay,
-                      )}
-                      <Badge
-                        variant={assignedPlug?.online === false
-                          ? 'destructive'
-                          : curRelayState === 'ON'
-                            ? 'success'
-                            : 'secondary'}
-                      >
-                        {assignedPlug?.friendly_name
-                          ? `${assignedPlug.friendly_name} (${currentTopic})`
-                          : currentTopic}
-                        {#if currentRelay > 1 || (assignedPlug?.relay_count ?? 1) > 1}
-                          · {t('tasmota-power.section.relayBadge', {
-                            relay: currentRelay,
-                          })}
-                        {/if}
-                        {#if assignedPlug}
-                          · {curRelayState}
-                          {#if assignedPlug.online !== false && curRelayState === 'ON' && assignedPlug.power_watts !== undefined}
-                            · {Math.round(assignedPlug.power_watts)} W
-                          {/if}
-                        {/if}
-                      </Badge>
-                    {:else}
-                      <Badge variant="outline">
-                        {t('tasmota-power.settings.noPlugAssigned')}
-                      </Badge>
-                    {/if}
-                    {#if justSaved[dev.id]}
-                      <Badge variant="success">
-                        ✓ {t('tasmota-power.settings.assignedSaved')}
-                      </Badge>
-                    {/if}
-                  </div>
+              <!-- Printer Header + Current Assignment Badge -->
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <div class="flex flex-wrap items-center gap-2 min-w-0">
+                  <span class="text-sm font-semibold truncate">
+                    {dev.name || dev.id}
+                  </span>
+                  <Badge variant="outline">{dev.model ?? 'Printer'}</Badge>
+                  {#if isCurrentAssigned && currentDriver}
+                    <Badge variant="secondary">
+                      {DRIVER_BADGE_LABELS[currentDriver]} · {currentTarget}
+                      {#if currentRelay > 1}
+                        · {t('tasmota-power.section.relayBadge', {
+                          relay: String(currentRelay),
+                        })}
+                      {/if}
+                    </Badge>
+                  {:else}
+                    <Badge variant="outline">
+                      {t('tasmota-power.settings.noPlugAssigned')}
+                    </Badge>
+                  {/if}
+                  {#if justSaved[dev.id]}
+                    <Badge variant="success">
+                      ✓ {t('tasmota-power.settings.assignedSaved')}
+                    </Badge>
+                  {/if}
                 </div>
 
-                <div class="flex flex-wrap items-center gap-2">
-                  <div class="inline-flex items-center rounded-sm border border-border p-0.5 bg-background/60">
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant={!isHttpMode ? 'default' : 'ghost'}
-                      class="h-7 px-2.5 text-xs"
-                      disabled={busy}
-                      onclick={() => {
-                        selectedModes[dev.id] = 'mqtt';
-                      }}
-                    >
-                      {t('tasmota-power.settings.modeMqtt')}
-                    </Button>
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant={isHttpMode ? 'default' : 'ghost'}
-                      class="h-7 px-2.5 text-xs"
-                      disabled={busy}
-                      onclick={() => {
-                        selectedModes[dev.id] = 'http';
-                      }}
-                    >
-                      {t('tasmota-power.settings.modeHttp')}
-                    </Button>
-                  </div>
-
-                  {#if isHttpMode}
-                    <Input
-                      type="text"
-                      size="sm"
-                      class="w-48"
-                      placeholder={t('tasmota-power.settings.httpHostPlaceholder')}
-                      value={httpHosts[dev.id] ?? currentHttpHost}
-                      oninput={(e: Event) => {
-                        httpHosts[dev.id] = (
-                          e.currentTarget as HTMLInputElement
-                        ).value;
-                      }}
-                    />
-                    <Input
-                      type="password"
-                      size="sm"
-                      class="w-44"
-                      placeholder={hasHttpPasswords[dev.id]
-                        ? t('tasmota-power.settings.httpPasswordSaved')
-                        : t('tasmota-power.settings.httpPasswordPlaceholder')}
-                      value={httpPasswords[dev.id] ?? ''}
-                      oninput={(e: Event) => {
-                        httpPasswords[dev.id] = (
-                          e.currentTarget as HTMLInputElement
-                        ).value;
-                      }}
-                    />
-                  {:else}
-                    {#if hasDiscovered && !manualOpen[dev.id]}
-                      <select
-                        class="h-8 rounded-sm border border-input bg-background px-2.5 text-xs min-w-[230px]"
-                        value={draftTopic}
-                        disabled={busy}
-                        onchange={(e) => {
-                          const nextTopic = (
-                            e.currentTarget as HTMLSelectElement
-                          ).value;
-                          selectedTopics[dev.id] = nextTopic;
-                          if (nextTopic === currentTopic) {
-                            selectedRelays[dev.id] = currentRelay;
-                          } else {
-                            selectedRelays[dev.id] = firstFreeRelay(
-                              plugByTopic(nextTopic),
-                              dev.id,
-                            );
-                          }
-                        }}
-                      >
-                        <option value="">
-                          {t('tasmota-power.settings.unassigned')}
-                        </option>
-                        {#each assignmentsData?.discovered_plugs ?? [] as plug (plug.topic)}
-                          {@const topic = plug.topic ?? ''}
-                          {@const fullyUsed = !plugHasFreeRelay(plug, dev.id)}
-                          <option value={topic} disabled={fullyUsed}>
-                            {plugLabel(plug, dev.id)}
-                          </option>
-                        {/each}
-                      </select>
-                    {/if}
-
-                    {#if showManual}
-                      <Input
-                        type="text"
-                        size="sm"
-                        class="w-44"
-                        placeholder={t('tasmota-power.settings.manualPlaceholder')}
-                        value={manualTopics[dev.id] ?? currentTopic}
-                        oninput={(e: Event) => {
-                          manualTopics[dev.id] = (
-                            e.currentTarget as HTMLInputElement
-                          ).value;
-                        }}
-                      />
-                    {/if}
-                  {/if}
-
-                  {#if showRelaySelect}
-                    {@const activeTopic = showManual
-                      ? (manualTopics[dev.id] ?? '').trim()
-                      : draftTopic}
-                    <select
-                      class="h-8 rounded-sm border border-input bg-background px-2 text-xs"
-                      value={String(draftRelay)}
-                      disabled={busy}
-                      onchange={(e) => {
-                        selectedRelays[dev.id] = Number.parseInt(
-                          (e.currentTarget as HTMLSelectElement).value,
-                          10,
-                        );
-                      }}
-                    >
-                      {#each Array.from({ length: relayCount }, (_, i) => i + 1) as rNum (rNum)}
-                        {@const rOwner = isHttpMode
-                          ? ownerOfHttp(draftHttpHost, rNum, dev.id)
-                          : ownerOfTopic(activeTopic, rNum, dev.id)}
-                        {@const rName = !isHttpMode
-                          ? draftPlug?.relay_names?.[rNum - 1]
-                          : undefined}
-                        <option value={String(rNum)} disabled={Boolean(rOwner)}>
-                          {t('tasmota-power.settings.relayOption', { relay: rNum })}
-                          {rName && rName !== draftPlug?.friendly_name ? ` (${rName})` : ''}
-                          {rOwner
-                            ? ` ${t('tasmota-power.settings.inUseBy', { printer: rOwner })}`
-                            : ''}
-                        </option>
-                      {/each}
-                    </select>
-                  {/if}
-
+                <div class="flex items-center gap-2">
                   <Button
                     type="button"
                     size="sm"
-                    variant={isDirty ? 'default' : 'secondary'}
-                    disabled={busy || !isDirty || Boolean(httpConflict)}
-                    onclick={() => {
-                      if (isHttpMode) {
-                        void assignHttp(dev.id, draftRelay);
-                      } else {
-                        void assignTopic(
-                          dev.id,
-                          showManual
-                            ? (manualTopics[dev.id] ?? '')
-                            : draftTopic,
-                          draftRelay,
-                        );
-                      }
-                    }}
+                    variant="default"
+                    disabled={busy || !draftCanSave(draft)}
+                    onclick={() => void saveDeviceDraft(dev.id)}
                   >
                     {t('tasmota-power.settings.saveTopic')}
                   </Button>
-
-                  {#if !isHttpMode && hasDiscovered}
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="ghost"
-                      onclick={() => {
-                        manualOpen[dev.id] = !manualOpen[dev.id];
-                      }}
-                    >
-                      {t('tasmota-power.settings.manualToggle')}
-                    </Button>
-                  {/if}
-
                   {#if isCurrentAssigned}
                     <Button
                       type="button"
@@ -1011,9 +1016,316 @@
                 </div>
               </div>
 
-              {#if httpConflict}
-                <p class="text-xs text-destructive">
-                  {t('tasmota-power.settings.inUseBy', { printer: httpConflict })}
+              <!-- Driver Selector + Driver-Specific Inputs -->
+              <div class="flex flex-wrap items-center gap-2">
+                <select
+                  aria-label={t('tasmota-power.settings.driverLabel')}
+                  class="h-8 rounded-sm border border-input bg-background px-2.5 text-xs min-w-[210px]"
+                  value={draft.driver}
+                  disabled={busy}
+                  onchange={(e) => {
+                    const nextDriver = (e.currentTarget as HTMLSelectElement)
+                      .value as PlugDriver;
+                    updateDraft(dev.id, {
+                      driver: nextDriver,
+                      manual: false,
+                    });
+                  }}
+                >
+                  {#each PLUG_DRIVER_OPTIONS as opt (opt.value)}
+                    <option value={opt.value}>{opt.label}</option>
+                  {/each}
+                </select>
+
+                {#if driverUsesHTTP(draft.driver)}
+                  <Input
+                    type="text"
+                    size="sm"
+                    class="w-48"
+                    placeholder={t('tasmota-power.settings.httpHostPlaceholder')}
+                    value={draft.httpHost}
+                    oninput={(e: Event) =>
+                      updateDraft(dev.id, {
+                        httpHost: (e.currentTarget as HTMLInputElement).value,
+                      })}
+                  />
+                  <Input
+                    type="password"
+                    size="sm"
+                    class="w-44"
+                    placeholder={draft.hasHttpPassword
+                      ? t('tasmota-power.settings.httpPasswordSaved')
+                      : t('tasmota-power.settings.httpPasswordPlaceholder')}
+                    value={draft.httpPassword}
+                    oninput={(e: Event) =>
+                      updateDraft(dev.id, {
+                        httpPassword: (e.currentTarget as HTMLInputElement).value,
+                      })}
+                  />
+                {:else if draft.driver === 'homeassistant'}
+                  {#if haSwitchEntities.length > 0}
+                    <select
+                      class="h-8 rounded-sm border border-input bg-background px-2.5 text-xs min-w-[220px]"
+                      value={draft.haEntityId}
+                      disabled={busy}
+                      onchange={(e) =>
+                        updateDraft(dev.id, {
+                          haEntityId: (e.currentTarget as HTMLSelectElement).value,
+                        })}
+                    >
+                      <option value="">
+                        {t('tasmota-power.settings.unassigned')}
+                      </option>
+                      {#each haSwitchEntities as ent (ent.entity_id)}
+                        <option value={ent.entity_id}>
+                          {ent.friendly_name
+                            ? `${ent.friendly_name} (${ent.entity_id})`
+                            : ent.entity_id}
+                        </option>
+                      {/each}
+                    </select>
+                  {:else}
+                    <Input
+                      type="text"
+                      size="sm"
+                      class="w-56"
+                      placeholder={t('tasmota-power.settings.haEntityPlaceholder')}
+                      value={draft.haEntityId}
+                      oninput={(e: Event) =>
+                        updateDraft(dev.id, {
+                          haEntityId: (e.currentTarget as HTMLInputElement).value,
+                        })}
+                    />
+                  {/if}
+
+                  {#if haPowerEntities.length > 0}
+                    <select
+                      class="h-8 rounded-sm border border-input bg-background px-2.5 text-xs min-w-[200px]"
+                      value={draft.haPowerEntityId}
+                      disabled={busy}
+                      onchange={(e) =>
+                        updateDraft(dev.id, {
+                          haPowerEntityId: (e.currentTarget as HTMLSelectElement)
+                            .value,
+                        })}
+                    >
+                      <option value="">
+                        {t('tasmota-power.settings.haPowerNone')}
+                      </option>
+                      {#each haPowerEntities as ent (ent.entity_id)}
+                        <option value={ent.entity_id}>
+                          {ent.friendly_name
+                            ? `${ent.friendly_name} (${ent.entity_id})`
+                            : ent.entity_id}
+                        </option>
+                      {/each}
+                    </select>
+                  {:else}
+                    <Input
+                      type="text"
+                      size="sm"
+                      class="w-56"
+                      placeholder={t(
+                        'tasmota-power.settings.haPowerEntityPlaceholder',
+                      )}
+                      value={draft.haPowerEntityId}
+                      oninput={(e: Event) =>
+                        updateDraft(dev.id, {
+                          haPowerEntityId: (e.currentTarget as HTMLInputElement)
+                            .value,
+                        })}
+                    />
+                  {/if}
+                {:else if draft.driver === 'generic_mqtt'}
+                  <Input
+                    type="text"
+                    size="sm"
+                    class="w-52"
+                    placeholder={t('tasmota-power.settings.genericCmdPlaceholder')}
+                    value={draft.mqttCmdTopic}
+                    oninput={(e: Event) =>
+                      updateDraft(dev.id, {
+                        mqttCmdTopic: (e.currentTarget as HTMLInputElement).value,
+                      })}
+                  />
+                  <Input
+                    type="text"
+                    size="sm"
+                    class="w-52"
+                    placeholder={t('tasmota-power.settings.genericStatePlaceholder')}
+                    value={draft.mqttStateTopic}
+                    oninput={(e: Event) =>
+                      updateDraft(dev.id, {
+                        mqttStateTopic: (e.currentTarget as HTMLInputElement).value,
+                      })}
+                  />
+                {:else if useDiscSelect}
+                  <select
+                    class="h-8 rounded-sm border border-input bg-background px-2.5 text-xs min-w-[230px]"
+                    value={draft.topic}
+                    disabled={busy}
+                    onchange={(e) => {
+                      const nextTopic = (e.currentTarget as HTMLSelectElement)
+                        .value;
+                      const nextRelay =
+                        nextTopic === currentTarget
+                          ? currentRelay
+                          : firstFreeRelay(
+                              draft.driver,
+                              plugByTopic(draft.driver, nextTopic),
+                              dev.id,
+                            );
+                      updateDraft(dev.id, {
+                        topic: nextTopic,
+                        relay: nextRelay,
+                      });
+                    }}
+                  >
+                    <option value="">
+                      {t('tasmota-power.settings.unassigned')}
+                    </option>
+                    {#each discList as plug (plug.topic)}
+                      {@const topic = plug.topic ?? ''}
+                      {@const fullyUsed = !plugHasFreeRelay(
+                        draft.driver,
+                        plug,
+                        dev.id,
+                      )}
+                      <option value={topic} disabled={fullyUsed}>
+                        {plugLabel(draft.driver, plug, dev.id)}
+                      </option>
+                    {/each}
+                  </select>
+                {:else}
+                  <Input
+                    type="text"
+                    size="sm"
+                    class="w-60"
+                    placeholder={topicPlaceholderForDriver(draft.driver)}
+                    value={draft.topic}
+                    oninput={(e: Event) =>
+                      updateDraft(dev.id, {
+                        topic: (e.currentTarget as HTMLInputElement).value,
+                      })}
+                  />
+                {/if}
+
+                {#if showRelay}
+                  <select
+                    class="h-8 rounded-sm border border-input bg-background px-2 text-xs"
+                    value={String(draft.relay)}
+                    disabled={busy}
+                    onchange={(e) =>
+                      updateDraft(dev.id, {
+                        relay: Number.parseInt(
+                          (e.currentTarget as HTMLSelectElement).value,
+                          10,
+                        ),
+                      })}
+                  >
+                    {#each Array.from({ length: relayCount }, (_, i) => i + 1) as rNum (rNum)}
+                      <option value={String(rNum)}>
+                        {t('tasmota-power.settings.relayOption', {
+                          relay: String(rNum),
+                        })}
+                      </option>
+                    {/each}
+                  </select>
+                {/if}
+
+                {#if (draft.driver === 'tasmota' || draft.driver === 'shelly_gen1') && hasDisc}
+                  <Button
+                    type="button"
+                    size="sm"
+                    variant="ghost"
+                    onclick={() =>
+                      updateDraft(dev.id, { manual: !draft.manual })}
+                  >
+                    {t('tasmota-power.settings.manualToggle')}
+                  </Button>
+                {/if}
+              </div>
+
+              {#if draft.driver === 'generic_mqtt'}
+                <div class="grid grid-cols-1 gap-2 sm:grid-cols-3">
+                  <Input
+                    type="text"
+                    size="sm"
+                    placeholder={t('tasmota-power.settings.genericAvailPlaceholder')}
+                    value={draft.mqttAvailTopic}
+                    oninput={(e: Event) =>
+                      updateDraft(dev.id, {
+                        mqttAvailTopic: (e.currentTarget as HTMLInputElement).value,
+                      })}
+                  />
+                  <Input
+                    type="text"
+                    size="sm"
+                    placeholder={t(
+                      'tasmota-power.settings.genericPayloadOnPlaceholder',
+                    )}
+                    value={draft.mqttPayloadOn}
+                    oninput={(e: Event) =>
+                      updateDraft(dev.id, {
+                        mqttPayloadOn: (e.currentTarget as HTMLInputElement).value,
+                      })}
+                  />
+                  <Input
+                    type="text"
+                    size="sm"
+                    placeholder={t(
+                      'tasmota-power.settings.genericPayloadOffPlaceholder',
+                    )}
+                    value={draft.mqttPayloadOff}
+                    oninput={(e: Event) =>
+                      updateDraft(dev.id, {
+                        mqttPayloadOff: (e.currentTarget as HTMLInputElement).value,
+                      })}
+                  />
+                  <Input
+                    type="text"
+                    size="sm"
+                    placeholder={t(
+                      'tasmota-power.settings.genericStateJsonPlaceholder',
+                    )}
+                    value={draft.mqttStateJsonKey}
+                    oninput={(e: Event) =>
+                      updateDraft(dev.id, {
+                        mqttStateJsonKey: (e.currentTarget as HTMLInputElement)
+                          .value,
+                      })}
+                  />
+                  <Input
+                    type="text"
+                    size="sm"
+                    placeholder={t(
+                      'tasmota-power.settings.genericPowerTopicPlaceholder',
+                    )}
+                    value={draft.mqttPowerTopic}
+                    oninput={(e: Event) =>
+                      updateDraft(dev.id, {
+                        mqttPowerTopic: (e.currentTarget as HTMLInputElement).value,
+                      })}
+                  />
+                  <Input
+                    type="text"
+                    size="sm"
+                    placeholder={t(
+                      'tasmota-power.settings.genericPowerJsonPlaceholder',
+                    )}
+                    value={draft.mqttPowerJsonKey}
+                    oninput={(e: Event) =>
+                      updateDraft(dev.id, {
+                        mqttPowerJsonKey: (e.currentTarget as HTMLInputElement)
+                          .value,
+                      })}
+                  />
+                </div>
+              {/if}
+
+              {#if draft.driver === 'homeassistant' && !settingsMeta?.ha_configured && haEntities.length === 0}
+                <p class="text-xs text-muted-foreground">
+                  {t('tasmota-power.settings.haNeedConfig')}
                 </p>
               {/if}
             </div>
