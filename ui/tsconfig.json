@@ -1,0 +1,15 @@
+{
+  "extends": "@prusa/frontend-standards/tsconfig.json",
+  "compilerOptions": {
+    "types": ["svelte", "vite/client", "node"],
+    "paths": {
+      "@prusa/connect": ["./node_modules/@prusa/connect/src/index.ts"],
+      "@prusa/connect-ui": ["./node_modules/@prusa/connect-ui/src/index.ts"],
+      "@prusa/connect-ui/build": [
+        "./node_modules/@prusa/connect-ui/build/module.ts"
+      ],
+      "@prusa/connect-ui/*": ["./node_modules/@prusa/connect-ui/src/*/index.ts"]
+    }
+  },
+  "include": ["src", "*.config.ts", "*.config.js"]
+}
