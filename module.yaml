@@ -97,6 +97,8 @@ ui:
         size: {w: 4, h: 4}
         least: {w: 2, h: 2}
         settings:
+          # Nothing picked shows every printer that has a plug, so the card
+          # needs no setting up on a server with one printer.
           - key: printers
             kind: printers
             label: Printers
