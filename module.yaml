@@ -92,7 +92,7 @@ ui:
     cards:
       - id: power
         title: Printer power
-        description: What your printers draw now, and which plugs are on.
+        description: What your printers draw now and over the last minutes, and which plugs are on.
         icon: chart-line
         size: {w: 4, h: 4}
         least: {w: 2, h: 2}
@@ -100,3 +100,16 @@ ui:
           - key: printers
             kind: printers
             label: Printers
+          - key: graph
+            kind: switch
+            label: Show the graph
+            default: true
+          - key: minutes
+            kind: choice
+            label: Span
+            options:
+              - {value: "5", label: 5 minutes}
+              - {value: "15", label: 15 minutes}
+              - {value: "30", label: 30 minutes}
+              - {value: "60", label: 1 hour}
+            default: "15"

@@ -340,3 +340,48 @@ func TestEveryActionAskedIsDeclared(t *testing.T) {
 		}
 	}
 }
+
+// The overview says what a person may change, so a page hides what they
+// cannot use. Those answers are kept, since the routes ask again.
+func TestTheOverviewSaysWhatAPersonMayChange(t *testing.T) {
+	access := &accessFake{allow: map[string]bool{actionOperate: true, actionOperateResource: true}}
+	m := guardedModule(t, "user:operator", access)
+	m.mu.Lock()
+	m.configs["p1"] = DeviceConfig{Driver: DriverTasmota, TasmotaTopic: "plug_1"}
+	m.configs["p2"] = DeviceConfig{}
+	m.mu.Unlock()
+
+	read := func() overviewResponse {
+		resp := m.buildOverview(overviewOptions{
+			visible:    func(string) bool { return true },
+			canOperate: func(id string) bool { return m.mayHint(context.Background(), "user:operator", mayOperate, id) },
+		})
+		resp.CanConfigure = m.mayHint(context.Background(), "user:operator", mayConfigure, "")
+		return resp
+	}
+	resp := read()
+	if resp.CanConfigure {
+		t.Fatal("an operator was offered the set-up")
+	}
+	if !resp.Devices[0].CanOperate || resp.Devices[1].CanOperate {
+		t.Fatalf("can_operate = %v, %v; want true for the printer with a plug only", resp.Devices[0].CanOperate, resp.Devices[1].CanOperate)
+	}
+	asked := len(access.asked())
+	read()
+	if len(access.asked()) != asked {
+		t.Fatal("the hints were asked again within hintKeep")
+	}
+
+	nobody := m.mayHint(context.Background(), "", mayOperate, "p1")
+	down := &accessFake{fail: errors.New("down")}
+	failing := guardedModule(t, "user:x", down)
+	if nobody || failing.mayHint(context.Background(), "user:x", mayOperate, "p1") {
+		t.Fatal("a hint without a person, or without an answer, offered the control")
+	}
+	// A host that cannot answer is not asked again on the next poll.
+	before := len(down.asked())
+	failing.mayHint(context.Background(), "user:x", mayOperate, "p1")
+	if len(down.asked()) != before {
+		t.Fatal("a failed hint was asked again at once")
+	}
+}

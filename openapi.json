@@ -98,7 +98,7 @@
       "get": {
         "operationId": "get-power-overview",
         "summary": "List every printer's plug and what it draws now",
-        "description": "Returns, for every printer the caller may see that has a plug or an auto-off choice, the saved plug with secrets left out, its live state and readings, and the energy since it was turned on. It reads memory only, so one request serves a whole list of printers. The host takes view_resource on the module before this is called.",
+        "description": "Returns, for every printer the caller may see that has a plug or an auto-off choice, the saved plug with secrets left out, its live state and readings, and the energy since it was turned on. It reads memory only, so one request serves a whole list of printers. can_configure and each printer's can_operate say what the caller may change, for what a page offers; each answer is kept for 30 seconds, and the routes ask again. The host takes view_resource on the module before this is called.",
         "responses": {
           "200": {
             "description": "Every visible printer's plug, and the state of both connections",
@@ -113,7 +113,19 @@
           "default": {
             "$ref": "#/components/responses/Refused"
           }
-        }
+        },
+        "parameters": [
+          {
+            "name": "history",
+            "in": "query",
+            "required": false,
+            "description": "Minutes of power samples each printer carries, for a graph: 1 to 60, larger values are read as 60. Without it, no samples.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        ]
       }
     },
     "/devices/{device_id}": {
@@ -391,6 +403,17 @@
           },
           "current_print_usage": {
             "$ref": "#/components/schemas/PrintPowerRecord"
+          },
+          "power_history": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PowerSample"
+            },
+            "description": "The power samples of the minutes ?history= asks for. An empty list when asked and there are none; absent when not asked."
+          },
+          "can_operate": {
+            "type": "boolean",
+            "description": "Whether the caller may switch this printer's plug."
           }
         }
       },
@@ -423,6 +446,10 @@
           },
           "poll_interval_sec": {
             "type": "integer"
+          },
+          "can_configure": {
+            "type": "boolean",
+            "description": "Whether the caller may change plugs and connections."
           }
         }
       },

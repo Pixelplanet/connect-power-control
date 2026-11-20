@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"sync"
+	"time"
 
 	"github.com/prusa3d/prusa-connect/sdk/accessapi"
 	"github.com/prusa3d/prusa-connect/sdk/routesapi"
@@ -150,4 +152,82 @@ func (m *module) guard(need right, next http.HandlerFunc) http.HandlerFunc {
 			next(w, r)
 		}
 	}
+}
+
+// What a page offers a person, a button to switch a plug or a form to change
+// the set-up, follows the same questions. Those answers only hide what the
+// person could not use, since every route asks again, so they are kept for a
+// while: a list of printers polled every few seconds asks the host about each
+// printer at most once in hintKeep.
+
+// hintKeep is how long an answer that only decides what a page offers is kept.
+// hintKeepFailed is how long a question the host could not answer is kept as
+// a no, so a host that cannot answer is not asked about every printer on
+// every poll.
+const (
+	hintKeep       = 30 * time.Second
+	hintKeepFailed = 10 * time.Second
+)
+
+type hintKey struct {
+	person   string
+	need     right
+	deviceID string
+}
+
+type hintAnswer struct {
+	allowed bool
+	until   time.Time
+}
+
+// hintCache keeps the answers mayHint gave, for hintKeep.
+type hintCache struct {
+	mu   sync.Mutex
+	kept map[hintKey]hintAnswer
+}
+
+// mayHint answers whether person holds need on deviceID, for what a page
+// offers. A question the host cannot answer is a no, kept for hintKeepFailed.
+func (m *module) mayHint(ctx context.Context, person string, need right, deviceID string) bool {
+	if person == "" || m.access == nil {
+		return false
+	}
+	key, now := hintKey{person, need, deviceID}, time.Now()
+
+	m.hints.mu.Lock()
+	k, ok := m.hints.kept[key]
+	m.hints.mu.Unlock()
+	if ok && now.Before(k.until) {
+		return k.allowed
+	}
+
+	allowed, keep := true, hintKeep
+	for _, q := range questionsFor(person, need, deviceID) {
+		yes, err := ask(ctx, m.access, q)
+		if err != nil {
+			if ctx.Err() != nil {
+				// The caller left; the host said nothing about the person.
+				return false
+			}
+			allowed, keep = false, hintKeepFailed
+			break
+		}
+		if !yes {
+			allowed = false
+			break
+		}
+	}
+
+	m.hints.mu.Lock()
+	defer m.hints.mu.Unlock()
+	if m.hints.kept == nil {
+		m.hints.kept = make(map[hintKey]hintAnswer)
+	}
+	for other, answer := range m.hints.kept {
+		if !now.Before(answer.until) {
+			delete(m.hints.kept, other)
+		}
+	}
+	m.hints.kept[key] = hintAnswer{allowed: allowed, until: now.Add(keep)}
+	return allowed
 }

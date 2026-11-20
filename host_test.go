@@ -183,7 +183,7 @@ func TestOverviewKeepsToVisiblePrinters(t *testing.T) {
 	m.configs["printer-c"] = DeviceConfig{}
 	m.mu.Unlock()
 
-	all := m.buildOverview(func(string) bool { return true })
+	all := m.buildOverview(overviewOptions{visible: func(string) bool { return true }})
 	if len(all.Devices) != 3 {
 		t.Fatalf("overview has %d printers, want 3", len(all.Devices))
 	}
@@ -200,7 +200,7 @@ func TestOverviewKeepsToVisiblePrinters(t *testing.T) {
 		t.Errorf("a printer with no plug has one: %+v", all.Devices[2].Plug)
 	}
 
-	some := m.buildOverview(func(id string) bool { return id == "printer-b" })
+	some := m.buildOverview(overviewOptions{visible: func(id string) bool { return id == "printer-b" }})
 	if len(some.Devices) != 1 || some.Devices[0].DeviceID != "printer-b" {
 		t.Fatalf("overview named a printer the caller may not see: %+v", some.Devices)
 	}
@@ -401,5 +401,72 @@ func TestAnOldBuiltinBrokerWithoutCredentialsStillSavesOtherSettings(t *testing.
 	rec = serve(m, "PUT", "/settings", `{"mqtt_builtin":true,"mqtt_username":"plugs"}`)
 	if rec.Code != http.StatusBadRequest {
 		t.Fatalf("status %d, want 400: %s", rec.Code, rec.Body.String())
+	}
+}
+
+func TestTheHistoryKeepsTheLastHour(t *testing.T) {
+	now := time.Unix(1_000_000, 0)
+	var history []PowerSample
+	for at := now.Add(-90 * time.Minute); !at.After(now); at = at.Add(30 * time.Second) {
+		history = append(history, PowerSample{Timestamp: at.Unix(), Watts: 1})
+	}
+	kept := trimHistory(history, now, powerHistoryKeep)
+	if first := time.Unix(kept[0].Timestamp, 0); now.Sub(first) > powerHistoryKeep {
+		t.Fatalf("kept a sample %v old", now.Sub(first))
+	}
+	if kept[len(kept)-1].Timestamp != now.Unix() {
+		t.Fatal("the newest sample was dropped")
+	}
+	if got := trimHistory(history, now, statusHistoryWindow); len(got) != 61 {
+		t.Fatalf("30 minutes at one sample each 30 s is 61 samples, got %d", len(got))
+	}
+}
+
+func TestTheOverviewCarriesTheGraphOnlyWhenAsked(t *testing.T) {
+	m := newModule(nil)
+	now := time.Now()
+	m.mu.Lock()
+	m.configs["printer-a"] = DeviceConfig{Driver: DriverTasmota, TasmotaTopic: "plug_a"}
+	m.usage["printer-a"] = &DeviceUsage{History: []PowerSample{
+		{Timestamp: now.Add(-2 * time.Hour).Unix(), Watts: 5},
+		{Timestamp: now.Add(-40 * time.Minute).Unix(), Watts: 80},
+		{Timestamp: now.Unix(), Watts: 120},
+	}}
+	m.mu.Unlock()
+	everyone := func(string) bool { return true }
+
+	if plain := m.buildOverview(overviewOptions{visible: everyone}); plain.Devices[0].PowerHistory != nil {
+		t.Fatal("the overview carried the graph without being asked")
+	}
+	hour := m.buildOverview(overviewOptions{visible: everyone, history: historyAsked("60")})
+	if got := *hour.Devices[0].PowerHistory; len(got) != 2 || got[0].Watts != 80 {
+		t.Fatalf("history = %+v, want the two samples of the last hour", got)
+	}
+	quarter := m.buildOverview(overviewOptions{visible: everyone, history: historyAsked("15")})
+	if got := *quarter.Devices[0].PowerHistory; len(got) != 1 || got[0].Watts != 120 {
+		t.Fatalf("history = %+v, want the one sample of the last 15 minutes", got)
+	}
+
+	// A printer with no samples yet answers an empty list, so a graph knows
+	// it was asked and is only quiet.
+	m.mu.Lock()
+	m.configs["printer-b"] = DeviceConfig{Driver: DriverTasmota, TasmotaTopic: "plug_b"}
+	m.mu.Unlock()
+	raw, err := json.Marshal(m.buildOverview(overviewOptions{visible: everyone, history: historyAsked("5")}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"device_id":"printer-b","config"`) || strings.Count(string(raw), `"power_history":`) != 2 {
+		t.Fatalf("each printer asked about should carry power_history: %s", raw)
+	}
+}
+
+func TestHistoryAskedIsClamped(t *testing.T) {
+	for raw, want := range map[string]time.Duration{
+		"": 0, "0": 0, "-5": 0, "x": 0, "1": time.Minute, "15": 15 * time.Minute, "600": powerHistoryKeep,
+	} {
+		if got := historyAsked(raw); got != want {
+			t.Errorf("historyAsked(%q) = %v, want %v", raw, got, want)
+		}
 	}
 }

@@ -45,8 +45,10 @@ const (
 	configsFileName     = "configs.json"
 	settingsFileName    = "settings.json"
 	usageFileName       = "usage.json"
-	maxPowerSamples     = 360
-	maxPrintHistory     = 10
+	// maxPowerSamples caps the samples kept per printer: an hour at one
+	// sample every two seconds, the shortest step between two samples.
+	maxPowerSamples = 1800
+	maxPrintHistory = 10
 )
 
 //go:embed openapi.json
@@ -670,6 +672,8 @@ type module struct {
 	// access is the host's access.check, asked before a route changes
 	// anything (access.go).
 	access accessChecker
+	// hints keeps the answers that only decide what a page offers.
+	hints hintCache
 	// principal reads the person a request is for. It is nil outside tests,
 	// which read it with routesapi.PrincipalOf.
 	principal func(*http.Request) string
@@ -1052,9 +1056,7 @@ func (m *module) loadAllUsage() {
 		if u == nil {
 			continue
 		}
-		if len(u.History) > maxPowerSamples {
-			u.History = u.History[len(u.History)-maxPowerSamples:]
-		}
+		u.History = trimHistory(u.History, time.Now(), powerHistoryKeep)
 		if len(u.PrintHistory) > maxPrintHistory {
 			u.PrintHistory = u.PrintHistory[:maxPrintHistory]
 		}
@@ -2732,9 +2734,7 @@ func (m *module) updateDeviceUsage(deviceID string, cfg DeviceConfig, safety pri
 			Timestamp: now.Unix(),
 			Watts:     math.Round(watts*10) / 10,
 		})
-		if len(u.History) > maxPowerSamples {
-			u.History = u.History[len(u.History)-maxPowerSamples:]
-		}
+		u.History = trimHistory(u.History, now, powerHistoryKeep)
 	}
 
 	if plugOn {
@@ -3185,14 +3185,44 @@ func (m *module) buildSettingsResponse() settingsResponse {
 	}
 }
 
+// powerHistoryKeep is how far back the power samples of a printer reach: the
+// longest span the dashboard card draws, the same as the core's temperature
+// card. statusHistoryWindow is what the printer's own page draws.
+const (
+	powerHistoryKeep    = 60 * time.Minute
+	statusHistoryWindow = 30 * time.Minute
+)
+
+// trimHistory drops the samples older than keep before now, and the oldest
+// beyond maxPowerSamples.
+func trimHistory(history []PowerSample, now time.Time, keep time.Duration) []PowerSample {
+	since := now.Add(-keep).Unix()
+	first := 0
+	for first < len(history) && history[first].Timestamp < since {
+		first++
+	}
+	history = history[first:]
+	if len(history) > maxPowerSamples {
+		history = history[len(history)-maxPowerSamples:]
+	}
+	return history
+}
+
 // overviewEntry is one printer's plug in the fleet overview: what a list of
-// every printer shows, without the graph samples and the print history.
+// every printer shows. The graph samples come only when asked for, and the
+// print history never.
 type overviewEntry struct {
 	DeviceID          string            `json:"device_id"`
 	Config            DeviceConfig      `json:"config"`
 	Plug              *PlugTelemetry    `json:"plug,omitempty"`
 	SessionUsage      *PowerSession     `json:"session_usage,omitempty"`
 	CurrentPrintUsage *PrintPowerRecord `json:"current_print_usage,omitempty"`
+	// PowerHistory is the samples of the last minutes ?history= names, at
+	// most an hour. It is an empty list, never left out, when asked for.
+	PowerHistory *[]PowerSample `json:"power_history,omitempty"`
+	// CanOperate says whether the caller may switch this printer's plug. It
+	// only decides what the page offers: the routes ask again.
+	CanOperate bool `json:"can_operate"`
 }
 
 type overviewResponse struct {
@@ -3204,6 +3234,31 @@ type overviewResponse struct {
 	DefaultCooldownSec int             `json:"default_cooldown_sec"`
 	ConfirmTurnOff     bool            `json:"confirm_turn_off"`
 	PollIntervalSec    int             `json:"poll_interval_sec"`
+	// CanConfigure says whether the caller may change plugs and
+	// connections. It only decides what the page offers.
+	CanConfigure bool `json:"can_configure"`
+}
+
+// historyAsked reads ?history=, the minutes of samples a graph draws, clamped
+// to powerHistoryKeep. Anything else, or nothing, asks for none.
+func historyAsked(raw string) time.Duration {
+	minutes, err := strconv.Atoi(strings.TrimSpace(raw))
+	if err != nil || minutes <= 0 {
+		return 0
+	}
+	asked := time.Duration(minutes) * time.Minute
+	return min(asked, powerHistoryKeep)
+}
+
+// overviewOptions is what a caller of buildOverview asks for beyond the plugs.
+type overviewOptions struct {
+	// visible answers whether the caller may see a printer.
+	visible func(deviceID string) bool
+	// history adds each printer's samples of the last history, none when 0.
+	history time.Duration
+	// canOperate answers whether the caller may switch a printer's plug;
+	// nil answers no.
+	canOperate func(deviceID string) bool
 }
 
 // plugSnapshotLocked is the plug a printer's config points at, with the state
@@ -3238,20 +3293,31 @@ func (m *module) plugSnapshotLocked(cfg DeviceConfig) *PlugTelemetry {
 // buildOverview answers every printer that has a plug or an auto-off setting,
 // kept to the printers visible answers true for. It reads memory only, so one
 // request serves a whole list of printers.
-func (m *module) buildOverview(visible func(deviceID string) bool) overviewResponse {
+func (m *module) buildOverview(opts overviewOptions) overviewResponse {
 	s := m.settings()
+	now := time.Now()
 	m.mu.RLock()
 	entries := make([]overviewEntry, 0, len(m.configs))
 	for deviceID, cfg := range m.configs {
-		if !visible(deviceID) {
+		if !opts.visible(deviceID) {
 			continue
 		}
 		entry := overviewEntry{DeviceID: deviceID, Config: cfg.redacted()}
 		if cfg.configured() {
 			entry.Plug = m.plugSnapshotLocked(cfg)
-			if usage := cloneDeviceUsage(m.usage[deviceID]); usage != nil {
+			if held := m.usage[deviceID]; held != nil {
+				// Only the parts the overview answers are copied, so a poll
+				// does not copy an hour of samples it does not send.
+				usage := cloneDeviceUsage(&DeviceUsage{Session: held.Session, CurrentPrint: held.CurrentPrint})
 				entry.SessionUsage = usage.Session
 				entry.CurrentPrintUsage = usage.CurrentPrint
+				if opts.history > 0 {
+					samples := append([]PowerSample{}, trimHistory(held.History, now, opts.history)...)
+					entry.PowerHistory = &samples
+				}
+			}
+			if opts.history > 0 && entry.PowerHistory == nil {
+				entry.PowerHistory = &[]PowerSample{}
 			}
 		}
 		entries = append(entries, entry)
@@ -3259,6 +3325,13 @@ func (m *module) buildOverview(visible func(deviceID string) bool) overviewRespo
 	up := m.mqttUp
 	errMsg := m.mqttError
 	m.mu.RUnlock()
+
+	// Asked outside the lock: each answer may be a question to the host.
+	if opts.canOperate != nil {
+		for i := range entries {
+			entries[i].CanOperate = entries[i].Config.configured() && opts.canOperate(entries[i].DeviceID)
+		}
+	}
 
 	sort.Slice(entries, func(i, j int) bool { return entries[i].DeviceID < entries[j].DeviceID })
 
@@ -3380,7 +3453,7 @@ func (m *module) buildStatus(ctx context.Context, principal, deviceID string) (s
 		printHistoryCopy []PrintPowerRecord
 	)
 	if usageCopy != nil {
-		historyCopy = usageCopy.History
+		historyCopy = trimHistory(usageCopy.History, time.Now(), statusHistoryWindow)
 		sessionCopy = usageCopy.Session
 		currentPrintCopy = usageCopy.CurrentPrint
 		printHistoryCopy = usageCopy.PrintHistory
@@ -3546,7 +3619,14 @@ func (m *module) routes() http.Handler {
 			refuse(w, r, InternalError.New(err.Error()))
 			return
 		}
-		answer(w, http.StatusOK, m.buildOverview(func(deviceID string) bool { return seen[deviceID] }))
+		person := m.principalOf(r)
+		resp := m.buildOverview(overviewOptions{
+			visible:    func(deviceID string) bool { return seen[deviceID] },
+			history:    historyAsked(r.URL.Query().Get("history")),
+			canOperate: func(deviceID string) bool { return m.mayHint(r.Context(), person, mayOperate, deviceID) },
+		})
+		resp.CanConfigure = m.mayHint(r.Context(), person, mayConfigure, "")
+		answer(w, http.StatusOK, resp)
 	})
 
 	mux.HandleFunc("GET /devices/{device_id}", func(w http.ResponseWriter, r *http.Request) {
