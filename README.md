@@ -8,22 +8,22 @@ Switches and monitors the smart plug of each printer inside Prusa Connect Local:
 
 ### Dark Mode
 
-| Settings & Plug Assignments | Printer Power Control & Live Graph |
+| The Plugs tab | A printer's Power Control section |
 |---|---|
-| ![Settings (Dark Mode)](docs/01_settings_dark.png) | ![Printer Power Control (Dark Mode)](docs/02_printer_graph_dark.png) |
+| ![The Plugs tab (Dark Mode)](docs/01_settings_dark.png) | ![Printer Power Control (Dark Mode)](docs/02_printer_graph_dark.png) |
 
-| Turn-Off Confirmation Dialog |
+| The Power Control page, asking before it turns a printer off |
 |---|
 | ![Turn-Off Confirmation (Dark Mode)](docs/03_turnoff_modal_dark.png) |
 
 <details>
 <summary>Light Mode Screenshots</summary>
 
-| Settings & Plug Assignments | Printer Power Control & Live Graph |
+| The Plugs tab | A printer's Power Control section |
 |---|---|
-| ![Settings (Light Mode)](docs/04_settings_light.png) | ![Printer Power Control (Light Mode)](docs/05_printer_graph_light.png) |
+| ![The Plugs tab (Light Mode)](docs/04_settings_light.png) | ![Printer Power Control (Light Mode)](docs/05_printer_graph_light.png) |
 
-| Turn-Off Confirmation Dialog |
+| The Power Control page, asking before it turns a printer off |
 |---|
 | ![Turn-Off Confirmation (Light Mode)](docs/06_turnoff_modal_light.png) |
 
@@ -35,23 +35,27 @@ Switches and monitors the smart plug of each printer inside Prusa Connect Local:
 - **Guided setup**: pick the plug, pick how Connect reaches it, fill in only what that plug needs. Plugs the broker finds and Home Assistant entities are picked from a list. The dialog says whether the plug answered.
 - **Three ways to connect**:
   - **Your own MQTT broker**, with TLS, credentials and a connection test.
-  - **The built-in MQTT broker** (TCP 1883 by default), for a network with no broker. It listens only on a port you approve, and warns when another broker already answers on that address.
+  - **The built-in MQTT broker** (TCP 1883 by default), for a network with no broker. It listens only on a port you approve, lets in only plugs that sign in with the user name and password you set, and warns when another broker already answers on that address.
   - **Directly by IP address**, with no broker at all.
 - **Active-print safety lock**: turning off is refused while the printer prints, is paused or busy, or while its axes still move.
 - **Auto-off after a print**: per printer, after a delay you set for all printers or for one. Turning off by hand asks first unless you switch the question off.
-- **Power Control page and dashboard card**: what the fleet draws now, which plugs are on, and buttons that switch each plug.
-- **Power graph and energy figures**: a 30-minute graph per printer, the energy since the plug was turned on, and the energy of each print.
+- **Auto-off only after a print that finished**: after a cancelled or a failed print the printer stays on, and a paused print never turns it off.
+- **Power Control page**: what the fleet draws now, which plugs are on, and buttons that switch each plug, as a table or as cards.
+- **Dashboard card with a power graph**: each printer's power over the last 5 to 60 minutes, over the same spans as the temperature card. It needs no setting up, and with one printer it is that printer's card.
+- **Power graph and energy figures**: a 30-minute graph on each printer's page, the energy since the plug was turned on, and the energy of each print.
+- **Follows the server's roles**: switching a plug takes the operator role on that printer, and changing plugs and connections takes the manager role. A person sees only the controls they may use.
 - **Broad Tasmota compatibility**: multi-relay devices (`POWER1`–`POWER8`), `SetOption4`, `SetOption26`, `SetOption90`, custom `StateText`, custom `FullTopic` and prefixes, stale `LWT` protection, and verified switching.
 
 ## Where to find it
 
 | place | what is there |
 |---|---|
-| Settings, Extensions, Connect Power Control, **Plugs** | every printer with its plug; set up, change, remove |
+| Settings, Extensions, Connect Power Control, **Plugs** | a card for every printer with its plug; set up, change, remove |
 | the same page, **Connections** | the MQTT broker and Home Assistant |
 | the same page, **Automation** | the power-off rules and each printer's auto-off |
 | **Power Control** in the sidebar | the whole fleet at once, as a table or as cards |
 | a printer's page, **Power Control** | that printer's plug, graph and energy |
+| a dashboard, the **Printer power** card | the power graph, beside the other cards |
 
 ## Building & Testing
 
@@ -61,5 +65,7 @@ make release  # builds all platforms declared in module.yaml into release/
 ```
 
 ## The built-in MQTT broker in Docker
+
+The built-in broker needs a user name and a password. Set both on the Connections tab, where a password can be generated, and set the same two values in each plug. Without them the broker does not start.
 
 If Prusa Connect runs in a bridge-networked Docker container and you switch on the built-in broker, publish its port on the container (`-p 1883:1883`) so the plugs on your network can reach it. Approve the port on the extension's Ports tab first; you can also move it there. A plug reached by its IP address needs no port on the container.
