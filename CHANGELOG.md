@@ -22,6 +22,9 @@
 - Rebuild the printer's **Power Control** section and the listing card line on the app's own components, in light and dark theme. A plug that does not answer is now said on the card instead of leaving the line empty.
 - Read every plug in one request (`GET /overview`), kept to the printers the caller may see, in place of one request per printer card.
 - Declare the built-in MQTT broker's port (`needs.listen`, TCP 1883). **The built-in broker now starts only on a port you approved**: after updating, approve it on the extension's Ports tab if you use the built-in broker. The port can be moved there.
+- Ask the host whether a person may do what a request asks before it changes anything. Switching a plug and the auto-off of a print take `operate_resource` on the extension and `operate` on that printer. Plugs, connections, tests, discovery and the plug list take `configure_resource` on the extension. A person who may not is refused with `FORBIDDEN`, and the actions are declared under `checks` in `module.yaml`.
+- **The built-in MQTT broker now needs a user name and a password**, and it lets in no client that does not sign in with them. After updating, an install whose built-in broker had none stops the broker and says so on the Connections tab: set both there, with **Generate password** if you like, and set the same two values in each plug.
+- This extension's own client reaches the built-in broker in process instead of over a loopback socket, and testing the built-in broker no longer opens a second listener on a random port.
 - Fix a start failure when `http_host` was written on the extension's host Settings tab. A value written there for `mqtt_host` or `ha_url` now fixes that value, and the Connections tab shows it as read-only.
 - Fix a new install starting with an auto-off delay of 0 seconds instead of the default 120.
 - Preserve full backwards compatibility with existing `mode: "mqtt"` and `mode: "http"` printer assignments.

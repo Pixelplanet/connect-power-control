@@ -17,6 +17,15 @@ require:
 permissions:
   - observe
 
+# What the module asks the host about the person behind a request, before it
+# changes anything: operate_resource on this extension and operate on the
+# printer to switch a plug, configure_resource on this extension to change
+# plugs and connections. It never takes these actions as itself.
+checks:
+  - operate
+  - operate_resource
+  - configure_resource
+
 needs:
   data: true
   listen:
@@ -39,8 +48,8 @@ egress:
   - option: mqtt_host
     ports: [1883, 8883]
     from: process
-    why: Switches and reads your smart plugs through the MQTT broker you set on the Connections tab.
-    sends: Power commands and state queries for the plugs you assigned to printers.
+    why: Reaches the MQTT broker set on the Connections tab or in mqtt_host. With the built-in broker, connects once to that address to check that plugs can reach it.
+    sends: Power commands and state queries for the plugs you assigned to printers, with the broker user name and password. The reachability check sends nothing.
   - option: http_host
     ports: [80, 443]
     from: process
