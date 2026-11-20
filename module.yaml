@@ -65,7 +65,7 @@ ui:
   contributes:
     pages:
       - path: power
-        title: Power
+        title: Power Control
         icon: chart-line
     device_section:
       - id: power-plug

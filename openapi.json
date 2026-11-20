@@ -171,8 +171,8 @@
     "/devices/{device_id}/auto-off": {
       "post": {
         "operationId": "post-device-auto-off",
-        "summary": "Arm or disarm automatic power-off when the current print finishes",
-        "description": "Enables or disables one-shot automatic power-off after the current print finishes and the cooldown period elapses.",
+        "summary": "Choose whether a printer turns off after a print",
+        "description": "With enabled alone, arms or disarms turning off after the print that runs now or the next one; the printer then goes back to its default. With default as well, sets whether the printer turns off after every print.",
         "parameters": [
           {
             "name": "device_id",

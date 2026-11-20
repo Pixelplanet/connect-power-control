@@ -39,7 +39,7 @@ Switches and monitors the smart plug of each printer inside Prusa Connect Local:
   - **Directly by IP address**, with no broker at all.
 - **Active-print safety lock**: turning off is refused while the printer prints, is paused or busy, or while its axes still move.
 - **Auto-off after a print**: per printer, after a delay you set for all printers or for one. Turning off by hand asks first unless you switch the question off.
-- **Power page and dashboard card**: what the fleet draws now, which plugs are on, and buttons that switch each plug.
+- **Power Control page and dashboard card**: what the fleet draws now, which plugs are on, and buttons that switch each plug.
 - **Power graph and energy figures**: a 30-minute graph per printer, the energy since the plug was turned on, and the energy of each print.
 - **Broad Tasmota compatibility**: multi-relay devices (`POWER1`–`POWER8`), `SetOption4`, `SetOption26`, `SetOption90`, custom `StateText`, custom `FullTopic` and prefixes, stale `LWT` protection, and verified switching.
 
@@ -50,7 +50,7 @@ Switches and monitors the smart plug of each printer inside Prusa Connect Local:
 | Settings, Extensions, Connect Power Control, **Plugs** | every printer with its plug; set up, change, remove |
 | the same page, **Connections** | the MQTT broker and Home Assistant |
 | the same page, **Automation** | the power-off rules and each printer's auto-off |
-| **Power** in the sidebar | the whole fleet at once |
+| **Power Control** in the sidebar | the whole fleet at once, as a table or as cards |
 | a printer's page, **Power Control** | that printer's plug, graph and energy |
 
 ## Building & Testing
