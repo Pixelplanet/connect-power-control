@@ -2,7 +2,7 @@
   "openapi": "3.1.0",
   "info": {
     "title": "connect-power-control",
-    "version": "0.5.0",
+    "version": "0.6.0",
     "description": "Multi-driver smart plug control and energy monitoring per printer (Tasmota, Shelly Gen1/Gen2+, Zigbee2MQTT, ESPHome, OpenBeken, Generic MQTT, and Home Assistant)."
   },
   "paths": {
@@ -23,7 +23,7 @@
       "put": {
         "operationId": "put-tasmota-settings",
         "summary": "Save the settings and reconnect",
-        "description": "Replaces the whole settings object in settings.json and reconnects the MQTT broker. A value pinned in the host's own settings is kept as pinned. The host takes view_resource on the module before this is called, and the module asks the host whether the caller holds configure_resource. A caller who does not is refused with FORBIDDEN (403).",
+        "description": "Replaces the whole settings object in settings.json and reconnects the MQTT broker. A value pinned in the host's own settings is kept as pinned. idle_off_min is after how many minutes a printer that is on and idle is turned off: 0, the default, never does that, and any other value is kept between 10 and 10080. The host takes view_resource on the module before this is called, and the module asks the host whether the caller holds configure_resource. A caller who does not is refused with FORBIDDEN (403).",
         "responses": {
           "200": {
             "description": "Updated MQTT settings and broker status"
@@ -128,11 +128,235 @@
         ]
       }
     },
+    "/energy": {
+      "get": {
+        "operationId": "get-energy-report",
+        "summary": "Read the energy and the cost of a day, a week, a month or a year",
+        "description": "Returns the energy the plugs recorded in the period, summed for every part of it, for each printer, for each print that ended in it and for each file name of those prints, with the cost at the price each quarter hour had. Days and night hours follow the site time zone of the energy settings. Three facts stay apart: no record (observed_sec is 0), a plug that was on but not measured (metered_sec is 0 while on_sec is not), and a measured figure, which may be a real zero. Every figure says how much of its energy went into prints and how much was used idle. Every cost is null while no price is set. The host takes view_resource on the module before this is called. Any caller the host lets see the module. The answer holds only printers the caller may see, and a printer the caller may not see is read as no filter.",
+        "parameters": [
+          {
+            "name": "span",
+            "in": "query",
+            "required": false,
+            "description": "The period: day, week (Monday to Sunday), month or year. Without it, month.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "day",
+                "week",
+                "month",
+                "year"
+              ]
+            }
+          },
+          {
+            "name": "at",
+            "in": "query",
+            "required": false,
+            "description": "A site day inside the wanted period, as YYYY-MM-DD. Without it, and for a day in the future, the current site day.",
+            "schema": {
+              "type": "string",
+              "format": "date"
+            }
+          },
+          {
+            "name": "device",
+            "in": "query",
+            "required": false,
+            "description": "A printer id, to narrow the figures to one printer. An id the caller may not see, or an unknown id, is read as no filter.",
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The energy report of the period",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnergyReport"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Refused"
+          }
+        }
+      }
+    },
+    "/energy/summary": {
+      "get": {
+        "operationId": "get-energy-summary",
+        "summary": "Read the energy and the cost of today and of this month",
+        "description": "Returns the energy and the cost of the current site day and the current site month, summed and for each printer, and the price per kWh that counts now. this_month equals total of GET /energy for the month, and today the one for the day. It reads no print, so a quarter hour an earlier version recorded counts as split_unknown_wh. Every cost is null while no price is set. It takes no parameters. The host takes view_resource on the module before this is called. Any caller the host lets see the module. The answer holds only printers the caller may see.",
+        "responses": {
+          "200": {
+            "description": "Today and this month",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnergySummary"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Refused"
+          }
+        }
+      }
+    },
+    "/energy/export": {
+      "get": {
+        "operationId": "get-energy-export",
+        "summary": "Read one part of the period as CSV text",
+        "description": "Returns the rows of GET /energy without its caps, as CSV text inside JSON: UTF-8, CRLF, comma, RFC 4180 quoting, dot decimals, times as site wall clock with offset. One part holds at most 2000 rows and at most 600 KB, so an answer stays under the host's bound of 1 MiB. Ask again with offset set to next_offset until next_offset is 0, which ends the file, and join the parts. Send the as_of of the first part with every later part: the parts are then read for one moment, and a print that ends during the download does not move the rows. Only the part at offset 0 starts with the header row. A text cell that starts with =, +, -, @, a tab or a carriage return gets a leading apostrophe. An empty cell is no price in cost and currency, and not measured in energy_kwh. The host takes view_resource on the module before this is called. Any caller the host lets see the module. The answer holds only printers the caller may see, and a printer the caller may not see is read as no filter.",
+        "parameters": [
+          {
+            "name": "span",
+            "in": "query",
+            "required": false,
+            "description": "The period: day, week (Monday to Sunday), month or year. Without it, month.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "day",
+                "week",
+                "month",
+                "year"
+              ]
+            }
+          },
+          {
+            "name": "at",
+            "in": "query",
+            "required": false,
+            "description": "A site day inside the wanted period, as YYYY-MM-DD. Without it, and for a day in the future, the current site day.",
+            "schema": {
+              "type": "string",
+              "format": "date"
+            }
+          },
+          {
+            "name": "device",
+            "in": "query",
+            "required": false,
+            "description": "A printer id, to narrow the figures to one printer. An id the caller may not see, or an unknown id, is read as no filter.",
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "table",
+            "in": "query",
+            "required": false,
+            "description": "Which table: periods (one row per part of the period and printer), prints (one row per print that ended in the period) or files (one row per file name of those prints). Without it, periods.",
+            "schema": {
+              "type": "string",
+              "enum": [
+                "periods",
+                "prints",
+                "files"
+              ]
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "description": "The row to start at, from next_offset of the part before. Without it, 0.",
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "as_of",
+            "in": "query",
+            "required": false,
+            "description": "The as_of of the first part, in unix seconds, to read a later part for the same moment. Without it, now. A value in the future or more than an hour old is refused with INVALID_INPUT.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "One part of the CSV file",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnergyExport"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Refused"
+          }
+        }
+      }
+    },
+    "/energy/settings": {
+      "get": {
+        "operationId": "get-energy-settings",
+        "summary": "Get the energy settings",
+        "description": "Returns how long energy records are kept, the site time zone, the currency label and the prices with the moment each counts from. A caller who may see the module may read the price, since the page shows cost. The host takes view_resource on the module before this is called.",
+        "responses": {
+          "200": {
+            "description": "The energy settings",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnergySettings"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Refused"
+          }
+        }
+      },
+      "put": {
+        "operationId": "put-energy-settings",
+        "summary": "Change the energy settings",
+        "description": "Changes the fields that are sent and keeps the others; an empty object changes nothing. The body is at most 16 KiB. The first price ever saved covers all earlier records. A later price counts from the quarter hour it is saved in, or replaces every earlier price with price_from set to start. A shorter keep_days that deletes records needs shorten, and deletes them at once. While prune_paused is true, any keep_days that deletes records needs shorten. A value that is refused answers INVALID_INPUT and saves nothing. The host takes view_resource on the module before this is called, and the module asks the host whether the caller holds configure_resource. A caller who does not is refused with FORBIDDEN (403).",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EnergySettingsChange"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "The energy settings after the change",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EnergySettings"
+                }
+              }
+            }
+          },
+          "default": {
+            "$ref": "#/components/responses/Refused"
+          }
+        }
+      }
+    },
     "/devices/{device_id}": {
       "get": {
         "operationId": "get-device-power",
         "summary": "Get one printer's plug, its live state, its power graph and its safety lock",
-        "description": "Returns the printer's saved plug, live relay and power readings, rolling power graph samples, session and per-print energy totals, the active-print safety lock, and the auto-off countdown. The host takes view_resource on the module before this is called.",
+        "description": "Returns the printer's saved plug, live relay and power readings, rolling power graph samples, session and per-print energy totals with their cost, the active-print safety lock, and the auto-off countdown. The host takes view_resource on the module before this is called.",
         "parameters": [
           {
             "name": "device_id",
@@ -164,7 +388,7 @@
       "put": {
         "operationId": "put-device-power-config",
         "summary": "Save one printer's plug and its auto-off choices",
-        "description": "Saves the driver, the plug's address (an MQTT topic, an IP address or host, a Home Assistant entity, or custom MQTT topics), the relay, the auto-off-after-print flag, and an optional delay of the printer's own. Answers 409 when another printer already has that plug and relay. The host takes view_resource on the module before this is called, and the module asks the host whether the caller holds configure_resource, and operate on the printer. A caller who does not is refused with FORBIDDEN (403).",
+        "description": "Saves the driver, the plug's address (an MQTT topic, an IP address or host, a Home Assistant entity, or custom MQTT topics), the relay, the auto-off-after-print flag, and an optional delay of the printer's own. idle_off_min is the printer's own idle time in minutes: left out, the setting for all printers counts; 0 never turns this printer off when idle; any other value is kept between 10 and 10080. Answers 409 when another printer already has that plug and relay. The host takes view_resource on the module before this is called, and the module asks the host whether the caller holds configure_resource, and operate on the printer. A caller who does not is refused with FORBIDDEN (403).",
         "parameters": [
           {
             "name": "device_id",
@@ -189,7 +413,7 @@
       "post": {
         "operationId": "post-device-power",
         "summary": "Turn a printer's plug on or off",
-        "description": "Switches the plug through its driver and verifies the resulting state. Refuses OFF, and a TOGGLE that would turn off, with 409 Conflict while the printer is printing or busy. The host takes view_resource on the module before this is called, and the module asks the host whether the caller holds operate_resource and operate on the printer. A caller who does not is refused with FORBIDDEN (403).",
+        "description": "Switches the plug through its driver and verifies the resulting state. Refuses OFF, and a TOGGLE that would turn off, with 409 Conflict while the printer is printing or busy. With idle_only set to true in the body, OFF is refused the same way for a printer Connect cannot reach. The host takes view_resource on the module before this is called, and the module asks the host whether the caller holds operate_resource and operate on the printer. A caller who does not is refused with FORBIDDEN (403).",
         "parameters": [
           {
             "name": "device_id",
@@ -203,6 +427,31 @@
         "responses": {
           "200": {
             "description": "Command sent and updated plug status"
+          },
+          "default": {
+            "$ref": "#/components/responses/Refused"
+          }
+        }
+      }
+    },
+    "/devices/{device_id}/idle-off": {
+      "post": {
+        "operationId": "post-device-idle-off",
+        "summary": "Keep an idle printer on",
+        "description": "Takes {\"action\": \"keep\"} and starts the printer's idle time again, so a printer that was about to be turned off for idling stays on for the whole time once more. Answers the printer's status. Another action is refused with INVALID_INPUT, and a printer with no plug with NOT_CONFIGURED. The host takes view_resource on the module before this is called, and the module asks the host whether the caller holds operate_resource and operate on the printer. A caller who does not is refused with FORBIDDEN (403).",
+        "parameters": [
+          {
+            "name": "device_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Updated device power plug status"
           },
           "default": {
             "$ref": "#/components/responses/Refused"
@@ -238,6 +487,53 @@
   },
   "components": {
     "schemas": {
+      "PlugState": {
+        "type": "object",
+        "description": "The live state and readings of a plug. The fields a driver cannot tell are left out.",
+        "properties": {
+          "power": {
+            "type": "string",
+            "description": "ON, OFF or UNKNOWN, for the relay the printer's plug names."
+          },
+          "online": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "Whether the plug answers. null for a plug that never said."
+          },
+          "power_watts": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "last_error": {
+            "type": "string"
+          },
+          "wifi_dbm": {
+            "type": "integer",
+            "description": "The plug's Wi-Fi signal in dBm, from -120 to 0. Tasmota and Shelly plugs only; left out where the plug did not tell it."
+          },
+          "after_power_cut": {
+            "type": "string",
+            "enum": [
+              "off",
+              "on",
+              "last",
+              "toggle",
+              "always_on",
+              "delayed_on",
+              "switch"
+            ],
+            "description": "What the plug's relay does when the power comes back after a cut. It is the plug's own setting (Tasmota PowerOnState, Shelly initial or default state), read and never changed. always_on is Tasmota PowerOnState 4: the plug stays on and refuses switching. Tasmota over MQTT and HTTP and Shelly over HTTP only; left out where the plug did not tell it."
+          },
+          "protection": {
+            "type": "string",
+            "description": "Set while the plug has turned itself off to protect itself: overpower, overtemp, overvoltage or undervoltage. Tasmota over MQTT tells overpower only (MaxPower), Shelly all four. Left out otherwise, and gone once the relay is on again."
+          }
+        }
+      },
       "PowerSample": {
         "type": "object",
         "properties": {
@@ -292,7 +588,8 @@
             "type": "boolean"
           },
           "outcome": {
-            "type": "string"
+            "type": "string",
+            "description": "finished, cancelled, failed, interrupted or unknown. interrupted: the printer went away during the print and did not come back printing it."
           },
           "started_at": {
             "type": "string",
@@ -313,6 +610,19 @@
           },
           "peak_watts": {
             "type": "number"
+          },
+          "metered_sec": {
+            "type": "number",
+            "description": "Seconds of the print the plug was on with a power reading."
+          },
+          "end_estimated": {
+            "type": "boolean",
+            "description": "The print ended while nothing was sampled, so ended_at is the last sample before that time."
+          },
+          "away_since": {
+            "type": "string",
+            "format": "date-time",
+            "description": "Set on a running print whose printer went away: when it did. The record stays open until the printer is back or the print is known to be over."
           }
         }
       },
@@ -333,6 +643,16 @@
           },
           "mqtt_error": {
             "type": "string"
+          },
+          "ha_configured": {
+            "type": "boolean"
+          },
+          "config": {
+            "type": "object",
+            "description": "The saved plug, with secrets left out"
+          },
+          "plug": {
+            "$ref": "#/components/schemas/PlugState"
           },
           "can_turn_off": {
             "type": "boolean"
@@ -355,6 +675,14 @@
           "auto_off_remaining_sec": {
             "type": "integer"
           },
+          "auto_off_error": {
+            "type": "string",
+            "description": "Why the plug could not be turned off after a print."
+          },
+          "auto_off_kept": {
+            "type": "string",
+            "description": "Why the printer stayed on after a print: cancelled or failed."
+          },
           "default_cooldown_sec": {
             "type": "integer"
           },
@@ -371,16 +699,88 @@
             }
           },
           "session_usage": {
-            "$ref": "#/components/schemas/PowerSession"
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PowerSession"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "cost": {
+                    "type": [
+                      "number",
+                      "null"
+                    ],
+                    "description": "The cost of the session. Priced by the rule of GET /energy: by the printer's own quarter hours between start and end, at most the last 31 days of them. null while no price is set."
+                  }
+                }
+              }
+            ]
           },
           "current_print_usage": {
-            "$ref": "#/components/schemas/PrintPowerRecord"
+            "allOf": [
+              {
+                "$ref": "#/components/schemas/PrintPowerRecord"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "cost": {
+                    "type": [
+                      "number",
+                      "null"
+                    ],
+                    "description": "The cost of the print. Priced by the rule of GET /energy: by the printer's own quarter hours between start and end, at most the last 31 days of them. null while no price is set. Also null for a print the plug had no reading for."
+                  }
+                }
+              }
+            ]
           },
           "print_history": {
             "type": "array",
             "items": {
-              "$ref": "#/components/schemas/PrintPowerRecord"
+              "allOf": [
+                {
+                  "$ref": "#/components/schemas/PrintPowerRecord"
+                },
+                {
+                  "type": "object",
+                  "properties": {
+                    "cost": {
+                      "type": [
+                        "number",
+                        "null"
+                      ],
+                      "description": "The cost of the print. Priced by the rule of GET /energy: by the printer's own quarter hours between start and end, at most the last 31 days of them. null while no price is set. Also null for a print the plug had no reading for."
+                    }
+                  }
+                }
+              ]
             }
+          },
+          "currency": {
+            "type": "string",
+            "description": "The currency label of the energy settings, for the cost of the session and the prints."
+          },
+          "price_set": {
+            "type": "boolean",
+            "description": "false while no price is set. Every cost is then null."
+          },
+          "idle_off_min": {
+            "type": "integer",
+            "description": "The idle time that counts for this printer in minutes: its own, or the one for all printers. 0 when it is never turned off for idling."
+          },
+          "idle_off_pending": {
+            "type": "boolean",
+            "description": "true while the idle time runs: the plug is on, and the printer is connected and neither printing, paused, busy nor moving."
+          },
+          "idle_off_remaining_sec": {
+            "type": "integer",
+            "description": "Seconds until the plug is turned off for idling, 0 while idle_off_pending is false."
+          },
+          "idle_off_error": {
+            "type": "string",
+            "description": "Why the plug could not be turned off when the idle time was over. The turn-off is tried again."
           }
         }
       },
@@ -395,7 +795,7 @@
             "description": "The saved plug, with secrets left out"
           },
           "plug": {
-            "type": "object",
+            "$ref": "#/components/schemas/PlugState",
             "description": "The live state and readings of the plug, absent for a printer with no plug"
           },
           "session_usage": {
@@ -414,6 +814,10 @@
           "can_operate": {
             "type": "boolean",
             "description": "Whether the caller may switch this printer's plug."
+          },
+          "idle_off_remaining_sec": {
+            "type": "integer",
+            "description": "Seconds until the plug is turned off because the printer is idle. Left out while no idle time runs for it."
           }
         }
       },
@@ -450,6 +854,699 @@
           "can_configure": {
             "type": "boolean",
             "description": "Whether the caller may change plugs and connections."
+          }
+        }
+      },
+      "EnergyFigures": {
+        "type": "object",
+        "properties": {
+          "energy_wh": {
+            "type": "number",
+            "description": "Measured energy in watt-hours."
+          },
+          "night_wh": {
+            "type": "number",
+            "description": "The part of energy_wh that fell into night hours. 0 while no night price counts."
+          },
+          "cost": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "The cost in the currency of the settings, rounded to 4 decimals. A positive amount is never rounded to 0: it answers 0.0001. null while no price is set."
+          },
+          "observed_sec": {
+            "type": "integer",
+            "description": "Seconds the plug answered, on or off. 0 means no record."
+          },
+          "on_sec": {
+            "type": "integer",
+            "description": "Seconds the plug was on."
+          },
+          "metered_sec": {
+            "type": "integer",
+            "description": "Seconds the plug was on with a power reading. 0 while on_sec is not means not measured."
+          },
+          "print_wh": {
+            "type": "number",
+            "description": "The part of energy_wh that went into a print."
+          },
+          "idle_wh": {
+            "type": "number",
+            "description": "The part of energy_wh used with no print running. energy_wh is print_wh, idle_wh and split_unknown_wh together."
+          },
+          "idle_cost": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "The cost of idle_wh at the price each quarter hour had, rounded to 4 decimals. null while no price is set."
+          },
+          "split_unknown_wh": {
+            "type": "number",
+            "description": "The part of energy_wh the record cannot split into printing and idle. It is never counted as idle."
+          },
+          "split_estimated": {
+            "type": "boolean",
+            "description": "Part of the split was worked out from the print records, for quarter hours an earlier version recorded. previous and GET /energy/summary never estimate: there such quarter hours count as split_unknown_wh."
+          }
+        }
+      },
+      "EnergyPoint": {
+        "type": "object",
+        "description": "One part of the period.",
+        "properties": {
+          "start": {
+            "type": "string",
+            "description": "The start of the part, with the site offset.",
+            "format": "date-time"
+          },
+          "day": {
+            "type": "string",
+            "description": "The site date of start.",
+            "format": "date"
+          },
+          "hour": {
+            "type": "integer",
+            "description": "The site hour of start. 0 unless span is day."
+          },
+          "energy_wh": {
+            "type": "number",
+            "description": "Measured energy in watt-hours."
+          },
+          "night_wh": {
+            "type": "number",
+            "description": "The part of energy_wh that fell into night hours. 0 while no night price counts."
+          },
+          "cost": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "The cost in the currency of the settings, rounded to 4 decimals. A positive amount is never rounded to 0: it answers 0.0001. null while no price is set."
+          },
+          "observed_sec": {
+            "type": "integer",
+            "description": "Seconds the plug answered, on or off. 0 means no record."
+          },
+          "on_sec": {
+            "type": "integer",
+            "description": "Seconds the plug was on."
+          },
+          "metered_sec": {
+            "type": "integer",
+            "description": "Seconds the plug was on with a power reading. 0 while on_sec is not means not measured."
+          },
+          "print_wh": {
+            "type": "number",
+            "description": "The part of energy_wh that went into a print."
+          },
+          "idle_wh": {
+            "type": "number",
+            "description": "The part of energy_wh used with no print running. energy_wh is print_wh, idle_wh and split_unknown_wh together."
+          },
+          "idle_cost": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "The cost of idle_wh at the price each quarter hour had, rounded to 4 decimals. null while no price is set."
+          },
+          "split_unknown_wh": {
+            "type": "number",
+            "description": "The part of energy_wh the record cannot split into printing and idle. It is never counted as idle."
+          },
+          "split_estimated": {
+            "type": "boolean",
+            "description": "Part of the split was worked out from the print records, for quarter hours an earlier version recorded. previous and GET /energy/summary never estimate: there such quarter hours count as split_unknown_wh."
+          }
+        }
+      },
+      "EnergyPrinter": {
+        "type": "object",
+        "properties": {
+          "device_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string",
+            "description": "The printer's name, the id where it has none."
+          },
+          "energy_wh": {
+            "type": "number",
+            "description": "Measured energy in watt-hours."
+          },
+          "night_wh": {
+            "type": "number",
+            "description": "The part of energy_wh that fell into night hours. 0 while no night price counts."
+          },
+          "cost": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "The cost in the currency of the settings, rounded to 4 decimals. A positive amount is never rounded to 0: it answers 0.0001. null while no price is set."
+          },
+          "observed_sec": {
+            "type": "integer",
+            "description": "Seconds the plug answered, on or off. 0 means no record."
+          },
+          "on_sec": {
+            "type": "integer",
+            "description": "Seconds the plug was on."
+          },
+          "metered_sec": {
+            "type": "integer",
+            "description": "Seconds the plug was on with a power reading. 0 while on_sec is not means not measured."
+          },
+          "print_wh": {
+            "type": "number",
+            "description": "The part of energy_wh that went into a print."
+          },
+          "idle_wh": {
+            "type": "number",
+            "description": "The part of energy_wh used with no print running. energy_wh is print_wh, idle_wh and split_unknown_wh together."
+          },
+          "idle_cost": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "The cost of idle_wh at the price each quarter hour had, rounded to 4 decimals. null while no price is set."
+          },
+          "split_unknown_wh": {
+            "type": "number",
+            "description": "The part of energy_wh the record cannot split into printing and idle. It is never counted as idle."
+          },
+          "split_estimated": {
+            "type": "boolean",
+            "description": "Part of the split was worked out from the print records, for quarter hours an earlier version recorded. previous and GET /energy/summary never estimate: there such quarter hours count as split_unknown_wh."
+          },
+          "prints": {
+            "type": "integer",
+            "description": "Prints of this printer that ended in the period."
+          }
+        }
+      },
+      "EnergyPrint": {
+        "type": "object",
+        "description": "One print that ended in the period. Its energy is priced by its printer's own quarter hours between its start and its end.",
+        "properties": {
+          "device_id": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "job_id": {
+            "type": "string"
+          },
+          "file_name": {
+            "type": "string"
+          },
+          "outcome": {
+            "type": "string",
+            "description": "finished, cancelled, failed, interrupted or unknown. interrupted: the printer went away during the print and did not come back printing it."
+          },
+          "started_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "ended_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "ended_local": {
+            "type": "string",
+            "description": "ended_at as site wall clock, such as 2026-11-18T14:05:00."
+          },
+          "duration_sec": {
+            "type": "integer"
+          },
+          "energy_wh": {
+            "type": "number"
+          },
+          "night_wh": {
+            "type": "number"
+          },
+          "cost": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "null while no price is set."
+          },
+          "metered_sec": {
+            "type": "integer",
+            "description": "Seconds of the print with a power reading. 0 means not measured."
+          },
+          "peak_watts": {
+            "type": "number"
+          },
+          "end_estimated": {
+            "type": "boolean",
+            "description": "The print ended while nothing was sampled."
+          }
+        }
+      },
+      "EnergyFile": {
+        "type": "object",
+        "description": "The prints of one G-code file name that ended in the period, on every printer the figures count.",
+        "properties": {
+          "file_name": {
+            "type": "string",
+            "description": "The file name, exact and case-sensitive. Empty for prints whose file name is not known."
+          },
+          "prints": {
+            "type": "integer",
+            "description": "All prints of the file."
+          },
+          "not_finished": {
+            "type": "integer",
+            "description": "Prints with the outcome failed, cancelled or interrupted."
+          },
+          "measured": {
+            "type": "integer",
+            "description": "Prints the plug had a power reading for. 0 means not measured."
+          },
+          "energy_wh": {
+            "type": "number",
+            "description": "Over the measured prints."
+          },
+          "cost": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "Over the measured prints. null while no price is set."
+          },
+          "avg_wh": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "The mean energy of the measured prints that finished. null with none."
+          },
+          "avg_cost": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "The mean cost of the measured prints that finished. null with none, and while no price is set."
+          }
+        }
+      },
+      "EnergyReport": {
+        "type": "object",
+        "properties": {
+          "span": {
+            "type": "string",
+            "description": "day, week, month or year."
+          },
+          "at": {
+            "type": "string",
+            "description": "The first site day of the period.",
+            "format": "date"
+          },
+          "prev_at": {
+            "type": "string",
+            "description": "The first day of the period before, empty when that period ends before earliest."
+          },
+          "next_at": {
+            "type": "string",
+            "description": "The first day of the period after, empty when this period holds the current day."
+          },
+          "from": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "to": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "earliest": {
+            "type": "string",
+            "description": "The oldest site day still kept, empty with no record."
+          },
+          "time_zone": {
+            "type": "string",
+            "description": "The site time zone as an IANA name, empty when days follow the server clock."
+          },
+          "zone_set": {
+            "type": "boolean"
+          },
+          "utc_offset_sec": {
+            "type": "integer",
+            "description": "The offset of the site zone from UTC now, in seconds."
+          },
+          "keep_days": {
+            "type": "integer"
+          },
+          "currency": {
+            "type": "string",
+            "description": "A label. Nothing is converted."
+          },
+          "price_set": {
+            "type": "boolean"
+          },
+          "night": {
+            "type": "boolean",
+            "description": "A price with a night price counts somewhere in the period."
+          },
+          "price_changed": {
+            "type": "boolean",
+            "description": "More than one price counts in the period."
+          },
+          "device": {
+            "type": "string",
+            "description": "The printer the figures are narrowed to, empty for all printers."
+          },
+          "recording": {
+            "type": "boolean",
+            "description": "false when the extension was given no data directory."
+          },
+          "can_configure": {
+            "type": "boolean",
+            "description": "Whether the caller may change the energy settings, for what a page offers."
+          },
+          "points": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EnergyPoint"
+            },
+            "description": "Every part of the period, also the empty ones: hours of a day, days of a week or a month, months of a year."
+          },
+          "total": {
+            "$ref": "#/components/schemas/EnergyFigures"
+          },
+          "previous": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/EnergyFigures"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The period before. null when it has no observed time."
+          },
+          "printers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EnergyPrinter"
+            },
+            "description": "The printers with a record in the period, most energy first, not narrowed by device, at most 500."
+          },
+          "printers_total": {
+            "type": "integer"
+          },
+          "removed": {
+            "type": "integer",
+            "description": "Printers with a record in the period that Connect no longer lists. They are left out of every figure."
+          },
+          "prints": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EnergyPrint"
+            },
+            "description": "The prints that ended in the period, newest first, at most 200."
+          },
+          "prints_total": {
+            "type": "integer"
+          },
+          "prints_wh": {
+            "type": "number",
+            "description": "Over all prints of the period."
+          },
+          "prints_cost": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "Over all prints of the period. null while no price is set."
+          },
+          "prints_dropped": {
+            "type": "integer",
+            "description": "Prints that were not kept, because a printer's month held 5000 already."
+          },
+          "files": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EnergyFile"
+            },
+            "description": "The prints of the period grouped by file name, most energy first, at most 200."
+          },
+          "files_total": {
+            "type": "integer",
+            "description": "The number of file names before the cap of files."
+          }
+        }
+      },
+      "EnergySummaryPrinter": {
+        "type": "object",
+        "properties": {
+          "device_id": {
+            "type": "string"
+          },
+          "today": {
+            "$ref": "#/components/schemas/EnergyFigures"
+          },
+          "this_month": {
+            "$ref": "#/components/schemas/EnergyFigures"
+          }
+        }
+      },
+      "EnergySummary": {
+        "type": "object",
+        "properties": {
+          "day": {
+            "type": "string",
+            "format": "date",
+            "description": "The current site day."
+          },
+          "month": {
+            "type": "string",
+            "description": "The current site month, as YYYY-MM."
+          },
+          "currency": {
+            "type": "string",
+            "description": "A label. Nothing is converted."
+          },
+          "price_set": {
+            "type": "boolean"
+          },
+          "price_now": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "The price per kWh that counts in the current quarter hour, the night price in night hours. null while no price is set."
+          },
+          "night_now": {
+            "type": "boolean",
+            "description": "The current quarter hour lies in the night hours of the price."
+          },
+          "price_changed": {
+            "type": "boolean",
+            "description": "More than one price counts in the month."
+          },
+          "recording": {
+            "type": "boolean",
+            "description": "false when the extension was given no data directory."
+          },
+          "today": {
+            "$ref": "#/components/schemas/EnergyFigures"
+          },
+          "this_month": {
+            "$ref": "#/components/schemas/EnergyFigures"
+          },
+          "printers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EnergySummaryPrinter"
+            },
+            "description": "The printers with a record this month, by id, at most 500."
+          }
+        }
+      },
+      "EnergyExport": {
+        "type": "object",
+        "properties": {
+          "file_name": {
+            "type": "string",
+            "description": "A name for the joined file, such as power-energy-month-2026-11-01.csv, power-prints-month-2026-11-01.csv or power-files-month-2026-11-01.csv."
+          },
+          "csv": {
+            "type": "string",
+            "description": "CSV text. The part at offset 0 starts with the header row."
+          },
+          "next_offset": {
+            "type": "integer",
+            "description": "The offset of the next part. 0: this was the last part."
+          },
+          "as_of": {
+            "type": "integer",
+            "description": "The moment the rows are read for, in unix seconds. Slots that start later and prints that ended later are left out. Send it back with every later part."
+          }
+        }
+      },
+      "EnergyTariff": {
+        "type": "object",
+        "description": "A price and the moment it counts from.",
+        "properties": {
+          "from": {
+            "type": "integer",
+            "description": "Unix seconds of the quarter hour the price counts from. 0: from the first record."
+          },
+          "price": {
+            "type": "number",
+            "description": "Per kWh."
+          },
+          "night": {
+            "type": "boolean"
+          },
+          "night_price": {
+            "type": "number",
+            "description": "Per kWh, during the night hours."
+          },
+          "night_start": {
+            "type": "integer",
+            "description": "The hour the night starts, 0 to 23, in the site zone."
+          },
+          "night_end": {
+            "type": "integer",
+            "description": "The hour the night ends, 0 to 23. It may be before night_start."
+          }
+        }
+      },
+      "EnergyPrice": {
+        "type": "object",
+        "properties": {
+          "price": {
+            "type": "number",
+            "description": "Per kWh, 0 to 1000.",
+            "minimum": 0,
+            "maximum": 1000
+          },
+          "night": {
+            "type": "boolean",
+            "description": "Use night_price during the night hours."
+          },
+          "night_price": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1000
+          },
+          "night_start": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 23
+          },
+          "night_end": {
+            "type": "integer",
+            "description": "Must differ from night_start.",
+            "minimum": 0,
+            "maximum": 23
+          }
+        }
+      },
+      "EnergySettings": {
+        "type": "object",
+        "properties": {
+          "keep_days": {
+            "type": "integer",
+            "description": "Days energy records are kept."
+          },
+          "time_zone": {
+            "type": "string",
+            "description": "The site time zone as an IANA name, empty when days follow the server clock."
+          },
+          "zone_set": {
+            "type": "boolean"
+          },
+          "utc_offset_sec": {
+            "type": "integer"
+          },
+          "currency": {
+            "type": "string",
+            "description": "A label shown with every cost."
+          },
+          "price": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/EnergyPrice"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The newest price. null with no price."
+          },
+          "price_since": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "date-time",
+            "description": "When the newest price started to count. null with no price, and for a price that covers every record."
+          },
+          "tariffs": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/EnergyTariff"
+            },
+            "description": "Every price, oldest first. Empty with no price."
+          },
+          "recording": {
+            "type": "boolean",
+            "description": "false when the extension was given no data directory."
+          },
+          "recording_since": {
+            "type": "string",
+            "description": "The UTC date of the oldest day on record, empty when there is none."
+          },
+          "prune_paused": {
+            "type": "boolean",
+            "description": "true while no record is deleted for its age, because the saved energy settings could not be read and keep_days is the default. A change that carries keep_days ends it."
+          }
+        }
+      },
+      "EnergySettingsChange": {
+        "type": "object",
+        "description": "A field that is not sent keeps its saved value.",
+        "properties": {
+          "keep_days": {
+            "type": "integer",
+            "minimum": 7,
+            "maximum": 3650
+          },
+          "shorten": {
+            "type": "boolean",
+            "description": "Needed when a smaller keep_days deletes records."
+          },
+          "time_zone": {
+            "type": "string",
+            "description": "An IANA name such as Europe/Prague, or empty to follow the server clock."
+          },
+          "currency": {
+            "type": "string",
+            "description": "At most 8 characters.",
+            "maxLength": 8
+          },
+          "price": {
+            "$ref": "#/components/schemas/EnergyPrice"
+          },
+          "price_from": {
+            "type": "string",
+            "description": "now: the price counts from this quarter hour on. start: it replaces every earlier price. Without it, now.",
+            "enum": [
+              "now",
+              "start"
+            ]
+          },
+          "clear_price": {
+            "type": "boolean",
+            "description": "Removes every price. Refused together with price."
           }
         }
       },

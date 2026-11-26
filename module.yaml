@@ -3,7 +3,7 @@ title: Connect Power Control
 summary: Control and monitor smart plugs (Tasmota, Shelly Gen1/Gen2+, Zigbee2MQTT, ESPHome, OpenBeken, Generic MQTT, and Home Assistant) for printers via MQTT, Direct HTTP, or REST, with active-print power-off protection and auto-off after print.
 codeowner: Pixelplanet
 kind: sink
-version: 0.5.0
+version: 0.6.0
 license: MIT
 contract_major: 1
 openapi: openapi.json
@@ -25,6 +25,13 @@ checks:
   - operate
   - operate_resource
   - configure_resource
+
+# What the module tells the server's event stream, for the operator's own
+# webhook or MQTT sink. The module itself sends nothing anywhere.
+events:
+  auto_off_done: auto_off.done
+  auto_off_failed: auto_off.failed
+  plug_lost: plug.lost
 
 needs:
   data: true
@@ -48,18 +55,18 @@ egress:
   - option: mqtt_host
     ports: [1883, 8883]
     from: process
-    why: Reaches the MQTT broker set on the Connections tab or in mqtt_host. With the built-in broker, connects once to that address to check that plugs can reach it.
-    sends: Power commands and state queries for the plugs you assigned to printers, with the broker user name and password. The reachability check sends nothing.
+    why: Reaches the MQTT broker set on the Connections tab or in mqtt_host, on the port set with it (1883, or 8883 with TLS, by default). With the built-in broker, checks once that plugs can reach it.
+    sends: Read-only state queries (relay state, meter reading, Wi-Fi signal, power-on setting) to the plugs it finds on the broker, so you can pick one; power commands only for the plugs you assigned to printers; with the broker user name and password. The reachability check sends nothing.
   - option: http_host
     ports: [80, 443]
     from: process
-    why: Switches and reads a Tasmota or Shelly plug directly at the address you give that plug on the Plugs tab.
+    why: Switches and reads a Tasmota or Shelly plug directly at the address you give that plug on the Plugs tab, on the port in that address, or 80 or 443 when it names none.
     sends: Status queries and relay commands for that plug, with its password when you set one.
   - option: ha_url
     ports: [8123, 80, 443]
     from: process
-    why: Switches and reads plugs through the Home Assistant server you set on the Connections tab.
-    sends: Your access token, state queries, and turn-on and turn-off calls for the entities you assigned to printers.
+    why: Switches and reads plugs through the Home Assistant server you set on the Connections tab, on the port in its URL (usually 8123), or 80 or 443 when it names none.
+    sends: Your access token, a request for the entity list (to offer switches and power sensors to pick from), and state queries and turn-on and turn-off calls for the entities you assigned to printers.
 
 platforms:
   - linux_amd64

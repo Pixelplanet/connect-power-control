@@ -12,8 +12,12 @@
   temperature card offers, so the two cards line up when one sits above the
   other. Without room, or with the graph switched off, it lists the printers.
 
+  A line at its foot says what today and this month used, and what that cost
+  when a price is set.
+
   The card polls nothing of its own. It reads the one overview the store keeps
-  for every screen, which carries the samples while a graph is shown, and
+  for every screen, which carries the samples while a graph is shown, and the
+  store's summary of today and this month, which is read once a minute. It
   links to the Power page for the rest.
 -->
 <script lang="ts">
@@ -26,8 +30,10 @@
   import { type CardProps, moduleIcon } from '@prusa/connect-ui/slots';
   import { onMount } from 'svelte';
 
+  import type { EnergyFigures } from './api';
+  import { factOf, factText, hasFigure, sumFigures } from './energy';
   import FaultNote from './fault-note.svelte';
-  import { formatWatts } from './format';
+  import { formatCost, formatEnergy, formatWatts } from './format';
   import { heldHost } from './host';
   import PlugBadge from './plug-badge.svelte';
   import { plugStateOf, STATE_LABELS, wattsNow } from './plug-state';
@@ -47,6 +53,8 @@
    * same height in every look of the app, so the room is measured.
    */
   const MIN_GRAPH_PX = 110;
+  /** The least height, in pixels, that holds the graph and the line under it. */
+  const GRAPH_AND_LINE_PX = 130;
   /** The spans the card offers, in minutes, as the temperature card does. */
   const SPANS = [5, 15, 30, 60] as const;
   const DEFAULT_SPAN = 15;
@@ -66,10 +74,74 @@
     const picked = Number(config.minutes);
     return SPANS.find((span) => span === picked) ?? DEFAULT_SPAN;
   });
+  const picked = $derived(
+    Array.isArray(config.printers)
+      ? config.printers.filter((id): id is string => typeof id === 'string')
+      : [],
+  );
+
+  $effect(() => power.watchSummary());
+
+  const summary = $derived(power.summary);
+  /** Today and this month, for every printer or for the picked ones. */
+  const periods = $derived.by(
+    (): { today: EnergyFigures; month: EnergyFigures } | undefined => {
+      if (!summary?.recording) return undefined;
+      if (picked.length === 0) {
+        return { today: summary.today, month: summary.this_month };
+      }
+      const chosen = summary.printers.filter((printer) =>
+        picked.includes(printer.device_id),
+      );
+
+      return {
+        today: sumFigures(chosen.map((printer) => printer.today)),
+        month: sumFigures(chosen.map((printer) => printer.this_month)),
+      };
+    },
+  );
+
+  /** One side of the line: energy, with its cost when a price is set. */
+  const sideOf = (figures: EnergyFigures): string => {
+    const fact = factOf(figures);
+    if (!hasFigure(fact)) return factText(t, fact);
+    const energy = formatEnergy(figures.energy_wh);
+    const partly = fact === 'partly';
+    if (figures.cost === null || summary === undefined) {
+      return partly ? t('power.dashboard.energyPartly', { energy }) : energy;
+    }
+
+    return t(
+      partly ? 'power.dashboard.amountPartly' : 'power.dashboard.amount',
+      { energy, cost: formatCost(figures.cost, summary.currency) },
+    );
+  };
+
+  /** The line at the foot, undefined while neither side has a figure. */
+  const energyLine = $derived.by((): string | undefined => {
+    if (periods === undefined) return undefined;
+    if (
+      !hasFigure(factOf(periods.today)) &&
+      !hasFigure(factOf(periods.month))
+    ) {
+      return undefined;
+    }
+
+    return t('power.dashboard.energy', {
+      today: sideOf(periods.today),
+      month: sideOf(periods.month),
+    });
+  });
+
   /** The height the card's body has, 0 until it is drawn. */
   let roomPx = $state(0);
   const showGraph = $derived(
     graphOn && (roomPx === 0 ? size.h >= GRAPH_ROWS : roomPx >= MIN_GRAPH_PX),
+  );
+  /** The graph keeps its room: in a low card the line gives way to it. */
+  const showLine = $derived(
+    energyLine !== undefined &&
+      (!showGraph || roomPx === 0 || roomPx >= GRAPH_AND_LINE_PX),
   );
 
   let now = $state(Date.now());
@@ -88,12 +160,6 @@
   // the longest span drawn. The card asks again when it starts or stops
   // drawing, or draws another span.
   $effect(() => power.watch({ graphMinutes: showGraph ? minutes : 0 }));
-
-  const picked = $derived(
-    Array.isArray(config.printers)
-      ? config.printers.filter((id): id is string => typeof id === 'string')
-      : [],
-  );
 
   const rows = $derived(
     host.fleet.devices
@@ -260,6 +326,15 @@
             {t('power.dashboard.more', { count: more })}
           </p>
         {/if}
+      {/if}
+      {#if showLine}
+        <p
+          class="text-muted-foreground mt-auto shrink-0 truncate text-xs tabular-nums"
+          title={energyLine}
+          data-part="energy-line"
+        >
+          {energyLine}
+        </p>
       {/if}
     </div>
   {/if}

@@ -12,6 +12,7 @@ import {
   createApi,
   type DeviceConfig,
   effectiveDriver,
+  type EnergySummary,
   type HAEntity,
   isDeviceConfigured,
   type OverviewEntry,
@@ -22,8 +23,11 @@ import {
   type SettingsResponse,
 } from './api';
 import { type Transport, transportOf } from './drivers';
+import { sameBroker, sameHaServer } from './secret-target';
 
 const POLL_MS = 5000;
+/** How often today and this month are read: they move slowly. */
+const SUMMARY_MS = 60_000;
 
 /** What a settings pane changes. A secret left empty keeps the saved one. */
 export type SettingsChanges = Partial<
@@ -40,6 +44,7 @@ export type SettingsChanges = Partial<
     | 'ha_token'
     | 'auto_off_cooldown_sec'
     | 'confirm_turn_off'
+    | 'idle_off_min'
   >
 >;
 
@@ -64,6 +69,12 @@ export class PowerStore {
   #timer: ReturnType<typeof setInterval> | undefined;
   #reading = false;
 
+  #summary = $state.raw<EnergySummary | undefined>(undefined);
+  #summaryWatchers = 0;
+  #summaryTimer: ReturnType<typeof setInterval> | undefined;
+  /** Counts the reads, so an answer that comes late does not win. */
+  #summaryAsked = 0;
+
   readonly #entries = $derived.by((): Readonly<Record<string, OverviewEntry>> =>
     Object.fromEntries(
       (this.#overview?.devices ?? []).map((entry) => [entry.device_id, entry]),
@@ -87,6 +98,7 @@ export class PowerStore {
       'abort',
       () => {
         this.#stop();
+        this.#stopSummary();
       },
       { once: true },
     );
@@ -190,6 +202,52 @@ export class PowerStore {
     };
   }
 
+  /**
+   * Today, this month and the price that counts now. Undefined until the
+   * first read answers, and where the process could not be read.
+   */
+  get summary(): EnergySummary | undefined {
+    return this.#summary;
+  }
+
+  /**
+   * Keeps the summary fresh while a screen shows it: one read at once, then
+   * one a minute for this browser, however many screens watch.
+   */
+  watchSummary(): () => void {
+    this.#summaryWatchers += 1;
+    if (this.#summaryWatchers === 1) {
+      void this.refreshSummary();
+      this.#summaryTimer = setInterval(() => {
+        if (document.visibilityState === 'visible') void this.refreshSummary();
+      }, SUMMARY_MS);
+    }
+
+    let released = false;
+
+    return () => {
+      if (released) return;
+      released = true;
+      this.#summaryWatchers -= 1;
+      if (this.#summaryWatchers === 0) this.#stopSummary();
+    };
+  }
+
+  /**
+   * Reads the summary again. A read that fails keeps the last answer and
+   * shows nothing: the figures are an extra on every screen that has them.
+   */
+  async refreshSummary(): Promise<void> {
+    this.#summaryAsked += 1;
+    const asked = this.#summaryAsked;
+    try {
+      const read = await this.#api.getEnergySummary();
+      if (asked === this.#summaryAsked) this.#summary = read;
+    } catch {
+      // Kept quiet on purpose, see above.
+    }
+  }
+
   /** Whether a graph joined while the last read was in flight. */
   #joinedDuringRead(): boolean {
     return this.#again;
@@ -238,14 +296,21 @@ export class PowerStore {
     const saved = this.#settings?.settings;
     const password = changes.mqtt_password ?? '';
     const token = changes.ha_token ?? '';
+    const next = { ...saved, ...changes };
 
+    // A saved secret is kept only for the address it was saved for.
     return {
-      ...saved,
-      ...changes,
+      ...next,
       mqtt_password: password,
-      keep_password: password === '' && Boolean(saved?.has_password),
+      keep_password:
+        password === '' &&
+        Boolean(saved?.has_password) &&
+        sameBroker(saved, next),
       ha_token: token,
-      keep_ha_token: token === '' && Boolean(saved?.has_ha_token),
+      keep_ha_token:
+        token === '' &&
+        Boolean(saved?.has_ha_token) &&
+        sameHaServer(saved?.ha_url, next.ha_url),
     };
   }
 
@@ -308,6 +373,14 @@ export class PowerStore {
     return status;
   }
 
+  /** Starts a printer's idle wait again. It throws what the process refused. */
+  async keepOn(deviceId: string): Promise<PowerStatus> {
+    const status = await this.#api.keepOn(deviceId);
+    await this.refresh();
+
+    return status;
+  }
+
   /** Switches one printer's plug. It throws what the process refused. */
   async sendPower(
     deviceId: string,
@@ -322,6 +395,11 @@ export class PowerStore {
   #stop(): void {
     if (this.#timer !== undefined) clearInterval(this.#timer);
     this.#timer = undefined;
+  }
+
+  #stopSummary(): void {
+    if (this.#summaryTimer !== undefined) clearInterval(this.#summaryTimer);
+    this.#summaryTimer = undefined;
   }
 }
 

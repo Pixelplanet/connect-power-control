@@ -12,6 +12,7 @@ import (
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 
+	"github.com/prusa3d/prusa-connect/sdk/diagnosticsapi"
 	"github.com/prusa3d/prusa-connect/sdk/wirerpc"
 )
 
@@ -101,6 +102,40 @@ func TestHostPinsWinOverSavedSettings(t *testing.T) {
 	}
 	if resp.SuggestedHTTPHost != "192.168.1.30" {
 		t.Errorf("suggested http host = %q", resp.SuggestedHTTPHost)
+	}
+}
+
+// A pin in the host's settings that names another broker or Home Assistant
+// never receives the password or token saved for the old address.
+func TestAPinnedAddressDoesNotGetTheSavedSecrets(t *testing.T) {
+	m := newModule(nil)
+	m.setDataDir(t.TempDir())
+	saved := normalizeSettings(Settings{
+		MQTTHost: "10.0.0.5", MQTTUsername: "plugs", MQTTPassword: "secret",
+		HAURL: "http://ha.lan:8123", HAToken: "token",
+	})
+	if err := m.writeSettingsToDisk(saved); err != nil {
+		t.Fatal(err)
+	}
+
+	m.setHostConfig(hostSettings{Settings: Settings{MQTTHost: "10.0.0.5", HAURL: "http://ha.lan:8123/"}}, wirerpc.Grants{})
+	if got := m.startSettings(hostSettings{}); got.MQTTPassword != "secret" || got.HAToken != "token" {
+		t.Fatalf("a pin naming the saved addresses lost the secrets: %+v", got)
+	}
+
+	m.setHostConfig(hostSettings{Settings: Settings{MQTTHost: "collector.example", HAURL: "http://collector.example:8123"}}, wirerpc.Grants{})
+	got := m.startSettings(hostSettings{})
+	if got.MQTTHost != "collector.example" || got.HAURL != "http://collector.example:8123" {
+		t.Fatalf("pins not applied: %+v", got)
+	}
+	if got.MQTTPassword != "" || got.HasPassword || got.HAToken != "" || got.HasHAToken {
+		t.Fatalf("a pinned new address got the saved secrets: %+v", got)
+	}
+
+	// settings.json keeps them, so removing the pin brings them back.
+	m.setHostConfig(hostSettings{}, wirerpc.Grants{})
+	if got = m.startSettings(hostSettings{}); got.MQTTPassword != "secret" || got.HAToken != "token" {
+		t.Fatalf("removing the pin did not bring the secrets back: %+v", got)
 	}
 }
 
@@ -374,6 +409,57 @@ func TestParseBrokerURL(t *testing.T) {
 	}
 }
 
+// A port outside 1 to 65535 is no address: the plug and Home Assistant
+// addresses are refused, and the broker falls back to its default port.
+func TestAddressesTakeOnlyTCPPorts(t *testing.T) {
+	for raw, want := range map[string]string{
+		"192.168.1.20":         "192.168.1.20",
+		"192.168.1.20:8080":    "192.168.1.20:8080",
+		"192.168.1.20:0":       "",
+		"192.168.1.20:65536":   "",
+		"https://plug.lan:443": "https://plug.lan:443",
+	} {
+		if got := normalizeHTTPHost(raw); got != want {
+			t.Errorf("normalizeHTTPHost(%q) = %q, want %q", raw, got, want)
+		}
+	}
+	for raw, want := range map[string]string{
+		"http://ha.lan:8123":  "http://ha.lan:8123",
+		"http://ha.lan:99999": "",
+		"http://ha.lan:0":     "",
+	} {
+		if got := normalizeBaseURL(raw); got != want {
+			t.Errorf("normalizeBaseURL(%q) = %q, want %q", raw, got, want)
+		}
+	}
+	if got := normalizeSettings(Settings{MQTTHost: "broker.lan", MQTTPort: 70000}); got.MQTTPort != defaultMQTTPort {
+		t.Errorf("mqtt port 70000 became %d, want the default %d", got.MQTTPort, defaultMQTTPort)
+	}
+	if _, port, _ := parseBrokerURL("broker.lan:70000"); port != 0 {
+		t.Errorf("parseBrokerURL kept port %d", port)
+	}
+}
+
+// The reachability check of the built-in broker dials only a port module.yaml
+// declares for the broker address.
+func TestTheReachabilityCheckDialsOnlyDeclaredPorts(t *testing.T) {
+	brk, err := StartEmbeddedBroker("127.0.0.1:0", "plugs", "secret")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = brk.Close() }()
+	if brk.Port() == defaultMQTTPort || brk.Port() == defaultMQTTTLSPort {
+		t.Skip("the free port is a declared one")
+	}
+	m := newModule(nil)
+	if warn := m.probeBuiltinBrokerReachability(brk, "192.0.2.1"); warn != "" {
+		t.Fatalf("probed an undeclared port: %q", warn)
+	}
+	if n := brk.AcceptedCount(); n != 0 {
+		t.Fatalf("the check opened %d connections", n)
+	}
+}
+
 // An install from before 0.5.0 runs the built-in broker without credentials.
 // It may still save its other settings; only turning the broker on, or
 // changing its credentials, needs both.
@@ -468,5 +554,59 @@ func TestHistoryAskedIsClamped(t *testing.T) {
 		if got := historyAsked(raw); got != want {
 			t.Errorf("historyAsked(%q) = %v, want %v", raw, got, want)
 		}
+	}
+}
+
+// The overview says how long an idle printer has left, and only for a
+// printer whose idle time runs.
+func TestTheOverviewCarriesTheIdleCountdown(t *testing.T) {
+	m, clock, cfg := idleModule(10)
+	other := seedPlug(m, DeviceConfig{Driver: DriverTasmotaHTTP, HTTPHost: "plug-2.lan"}, "OFF", 0)
+	m.configs["p2"] = other
+	all := overviewOptions{visible: func(string) bool { return true }}
+
+	for _, entry := range m.buildOverview(all).Devices {
+		if entry.IdleOffRemainingSec != nil {
+			t.Fatalf("%s has a countdown before its idle time runs", entry.DeviceID)
+		}
+	}
+
+	idleAfter(m, clock, cfg, printerIdle, 0)
+	m.idleTick("p2", other, printerIdle, 10*time.Minute, clock.now())
+	clock.add(4 * time.Minute)
+	entries := m.buildOverview(all).Devices
+	if len(entries) != 2 || entries[0].DeviceID != "p1" {
+		t.Fatalf("overview = %+v", entries)
+	}
+	if left := entries[0].IdleOffRemainingSec; left == nil || *left != 360 {
+		t.Fatalf("p1 has %v seconds left, want 360", left)
+	}
+	if entries[1].IdleOffRemainingSec != nil {
+		t.Fatalf("a plug that is off has a countdown: %d", *entries[1].IdleOffRemainingSec)
+	}
+
+	raw, err := json.Marshal(entries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.Count(string(raw), `"idle_off_remaining_sec":360`); got != 1 {
+		t.Fatalf("the countdown is in the answer %d times: %s", got, raw)
+	}
+
+	// Past its time and not yet off, it reads 0 and not less.
+	clock.add(time.Hour)
+	if left := m.buildOverview(all).Devices[0].IdleOffRemainingSec; left == nil || *left != 0 {
+		t.Fatalf("an idle time that is over reads %v", left)
+	}
+}
+
+// The host asks only a module that says so for its diagnostics.
+func TestInfoServesDiagnostics(t *testing.T) {
+	info := moduleInfo()
+	if !info.Answers(diagnosticsapi.MethodCollect) || !info.Answers(wirerpc.MethodConfigure) {
+		t.Fatalf("serves = %v", info.Serves)
+	}
+	if info.Name != name || info.Version != release {
+		t.Fatalf("info = %+v", info)
 	}
 }

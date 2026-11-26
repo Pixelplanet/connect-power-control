@@ -32,7 +32,20 @@ const (
 	mqttPktDisconnect  = 14
 
 	maxMQTTPacketBytes = 1024 * 1024 // 1 MiB safety limit for embedded plug broker
+
+	// maxConnectBytes bounds the first packet, read before the client has
+	// signed in. A CONNECT with a will and credentials fits easily.
+	maxConnectBytes = 64 * 1024
+
+	// maxPendingConns bounds the network connections that have not signed in
+	// yet. A connection over the limit is closed at once, so clients that
+	// never sign in cannot pile up memory on the host.
+	maxPendingConns = 32
 )
+
+// badSignInDelay is how long a refused sign-in waits before its answer, so
+// passwords cannot be guessed at speed. Tests shorten it.
+var badSignInDelay = time.Second
 
 type retainedMessage struct {
 	topic   string
@@ -59,6 +72,7 @@ type EmbeddedBroker struct {
 	retained map[string]retainedMessage
 	nextSeq  atomic.Uint64
 	accepted atomic.Uint64
+	pending  chan struct{} // one slot for each connection not signed in yet
 	wg       sync.WaitGroup
 }
 
@@ -116,6 +130,7 @@ func StartEmbeddedBroker(listenAddr, username, password string) (*EmbeddedBroker
 		clients:  make(map[*brokerClient]struct{}),
 		byID:     make(map[string]*brokerClient),
 		retained: make(map[string]retainedMessage),
+		pending:  make(chan struct{}, maxPendingConns),
 	}
 
 	b.wg.Add(1)
@@ -157,7 +172,8 @@ func (b *EmbeddedBroker) Pipe() (net.Conn, error) {
 	b.mu.Unlock()
 
 	server, client := net.Pipe()
-	go b.handleConn(server)
+	// The module's own client takes no slot, so it is never locked out.
+	go b.handleConn(server, false)
 	return client, nil
 }
 
@@ -218,18 +234,33 @@ func (b *EmbeddedBroker) acceptLoop() {
 		}
 
 		b.accepted.Add(1)
+		select {
+		case b.pending <- struct{}{}:
+		default:
+			_ = conn.Close() // too many connections wait to sign in
+			continue
+		}
 		b.wg.Add(1)
-		go b.handleConn(conn)
+		go b.handleConn(conn, true)
 	}
 }
 
-func (b *EmbeddedBroker) handleConn(conn net.Conn) {
+// handleConn serves one client. slot tells that the connection holds a slot
+// in b.pending, given back once the sign-in is answered.
+func (b *EmbeddedBroker) handleConn(conn net.Conn, slot bool) {
 	defer b.wg.Done()
+	release := func() {
+		if slot {
+			slot = false
+			<-b.pending
+		}
+	}
+	defer release()
 
 	reader := bufio.NewReaderSize(conn, 16*1024)
 	_ = conn.SetReadDeadline(time.Now().Add(15 * time.Second))
 
-	pktType, flags, body, err := readMQTTPacket(reader)
+	pktType, flags, body, err := readMQTTPacketMax(reader, maxConnectBytes)
 	if err != nil || pktType != mqttPktConnect || (flags&0x0F) != 0 {
 		_ = conn.Close()
 		return
@@ -237,10 +268,14 @@ func (b *EmbeddedBroker) handleConn(conn net.Conn) {
 
 	c, rc := b.parseConnect(conn, reader, body)
 	if rc != 0 {
+		if rc == 0x04 {
+			time.Sleep(badSignInDelay)
+		}
 		_ = writeMQTTFrame(conn, []byte{mqttPktConnack << 4, 0x02, 0x00, rc})
 		_ = conn.Close()
 		return
 	}
+	release()
 
 	var replaced *brokerClient
 	b.mu.Lock()
@@ -761,6 +796,12 @@ func mqttTopicMatch(filter, topic string) bool {
 }
 
 func readMQTTPacket(r *bufio.Reader) (byte, byte, []byte, error) {
+	return readMQTTPacketMax(r, maxMQTTPacketBytes)
+}
+
+// readMQTTPacketMax reads one packet whose body is at most limit bytes. The
+// size is checked before the body is allocated.
+func readMQTTPacketMax(r *bufio.Reader, limit int) (byte, byte, []byte, error) {
 	b0, err := r.ReadByte()
 	if err != nil {
 		return 0, 0, nil, err
@@ -772,7 +813,7 @@ func readMQTTPacket(r *bufio.Reader) (byte, byte, []byte, error) {
 	if err != nil {
 		return 0, 0, nil, err
 	}
-	if remLen > maxMQTTPacketBytes {
+	if remLen > limit {
 		return 0, 0, nil, errors.New("mqtt packet exceeds max size")
 	}
 

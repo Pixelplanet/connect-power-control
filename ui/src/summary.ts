@@ -18,6 +18,20 @@ export interface PlugListRow extends PlugRow {
   readonly model: string;
 }
 
+/** A printer that "Turn off idle printers" left on, and why in words. */
+export interface StayedOn {
+  readonly id: string;
+  readonly name: string;
+  readonly reason: string;
+}
+
+/** What one run of "Turn off idle printers" did. */
+export interface AllOffResult {
+  /** How many printers were turned off. */
+  readonly done: number;
+  readonly stayed: readonly StayedOn[];
+}
+
 export interface PlugTotals {
   /** What every plug that reports a reading draws now, added up. */
   readonly watts: number;

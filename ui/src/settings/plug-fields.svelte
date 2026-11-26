@@ -23,6 +23,7 @@
   } from '../api';
   import {
     DRIVER_FIELDS,
+    keepsPlugPassword,
     MAX_RELAYS,
     type PlugDraft,
     routeOf,
@@ -64,6 +65,13 @@
 
   const fields = $derived(DRIVER_FIELDS[draft.driver]);
   const transport = $derived(routeOf(draft.driver).transport);
+  const passwordHint = $derived.by((): string => {
+    if (keepsPlugPassword(draft)) return t('power.field.secretSaved');
+
+    return draft.hasHttpPassword
+      ? t('power.field.secretAgain')
+      : t('power.field.optional');
+  });
 
   // The plugs the broker listed for this driver. Tasmota plugs carry no
   // driver name of their own.
@@ -266,9 +274,7 @@
         type: 'password',
         value: draft.httpPassword,
         oninput: typed((value) => (draft.httpPassword = value)),
-        placeholder: draft.hasHttpPassword
-          ? t('power.field.secretSaved')
-          : t('power.field.optional'),
+        placeholder: passwordHint,
         autocomplete: 'new-password',
       }}
     />

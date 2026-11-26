@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"net/url"
 	"strconv"
@@ -107,7 +108,7 @@ func normalizeBaseURL(raw string) string {
 		s = "http://" + s
 	}
 	u, err := url.Parse(s)
-	if err != nil || strings.TrimSpace(u.Host) == "" {
+	if err != nil || strings.TrimSpace(u.Host) == "" || !portAllowed(u.Port()) {
 		return ""
 	}
 	scheme := strings.ToLower(u.Scheme)
@@ -180,6 +181,8 @@ func (c DeviceConfig) driverSubscriptions() []string {
 			fmt.Sprintf("shellies/%s/online", id),
 			fmt.Sprintf("shellies/%s/relay/%d", id, zeroIdx),
 			fmt.Sprintf("shellies/%s/relay/%d/power", id, zeroIdx),
+			fmt.Sprintf("shellies/%s/overtemperature", id),
+			fmt.Sprintf("shellies/%s/info", id),
 		}
 	case DriverShellyGen2:
 		prefix := normalizeMQTTPrefix(c.TasmotaTopic)
@@ -189,6 +192,7 @@ func (c DeviceConfig) driverSubscriptions() []string {
 		return []string{
 			fmt.Sprintf("%s/online", prefix),
 			fmt.Sprintf("%s/status/switch:%d", prefix, zeroIdx),
+			fmt.Sprintf("%s/status/wifi", prefix),
 		}
 	case DriverZigbee2MQTT:
 		base := normalizeZ2MTopic(c.TasmotaTopic)
@@ -342,6 +346,7 @@ func (m *module) handleDriverMQTTPacket(msgTopic string, payloadBytes []byte, no
 					case "on":
 						plug.setRelayState(relayNum, "ON")
 						plug.LastError = ""
+						plug.setProtection(relayNum, "")
 						plug.UpdatedAt = &now
 						m.notifyWaitersLocked(key, relayNum, stateEvent{State: "ON"})
 					case "off":
@@ -351,6 +356,7 @@ func (m *module) handleDriverMQTTPacket(msgTopic string, payloadBytes []byte, no
 					case "overpower":
 						plug.setRelayState(relayNum, "OFF")
 						plug.LastError = "overpower protection triggered"
+						plug.setProtection(relayNum, protectOverpower)
 						plug.UpdatedAt = &now
 						m.notifyWaitersLocked(key, relayNum, stateEvent{State: "OFF", Err: "overpower protection triggered"})
 					}
@@ -360,11 +366,37 @@ func (m *module) handleDriverMQTTPacket(msgTopic string, payloadBytes []byte, no
 					handled = true
 				}
 			case len(parts) == 5 && parts[2] == "relay" && parts[4] == "power":
-				if w, err := strconv.ParseFloat(payload, 64); err == nil {
+				if w, ok := parseReading(payload); ok {
 					plug.PowerWatts = &w
+					plug.meterAt = now
 					plug.UpdatedAt = &now
 					handled = true
 				}
+			case len(parts) == 3 && parts[2] == "overtemperature":
+				// The whole device is too hot. Its relays are off until it
+				// has cooled down.
+				switch payload {
+				case "1":
+					plug.setProtection(0, protectOvertemp)
+				case "0":
+					if plug.protections[0] == protectOvertemp {
+						plug.setProtection(0, "")
+					}
+				}
+				plug.UpdatedAt = &now
+				handled = true
+			case len(parts) == 3 && parts[2] == "info" && strings.HasPrefix(payload, "{"):
+				// Published by the firmware by itself. Only the signal is
+				// read; the name of the network is not.
+				var info struct {
+					WifiSta struct {
+						RSSI *float64 `json:"rssi"`
+					} `json:"wifi_sta"`
+				}
+				if json.Unmarshal(payloadBytes, &info) == nil && info.WifiSta.RSSI != nil {
+					plug.setWifi(*info.WifiSta.RSSI)
+				}
+				handled = true
 			}
 		}
 	}
@@ -388,18 +420,28 @@ func (m *module) handleDriverMQTTPacket(msgTopic string, payloadBytes []byte, no
 				plug.Online = &on
 				plug.UpdatedAt = &now
 				handled = true
+			} else if msgTopic == prefix+"/status/wifi" && strings.HasPrefix(payload, "{") {
+				var wifi struct {
+					RSSI *float64 `json:"rssi"`
+				}
+				if json.Unmarshal(payloadBytes, &wifi) == nil && wifi.RSSI != nil {
+					m.ensureDriverPlugLocked(key, d, prefix).setWifi(*wifi.RSSI)
+				}
+				handled = true
 			} else if msgTopic == fmt.Sprintf("%s/status/switch:%d", prefix, zeroIdx) && strings.HasPrefix(payload, "{") {
 				var st struct {
 					Output  *bool    `json:"output"`
 					APower  *float64 `json:"apower"`
 					Voltage *float64 `json:"voltage"`
 					Current *float64 `json:"current"`
+					Errors  []string `json:"errors"`
 				}
 				if json.Unmarshal(payloadBytes, &st) == nil {
 					plug := m.ensureDriverPlugLocked(key, d, prefix)
 					online := true
 					plug.Online = &online
 					plug.UpdatedAt = &now
+					plug.setProtection(relay, shellyProtection(st.Errors))
 					if st.Output != nil {
 						state := "OFF"
 						if *st.Output {
@@ -410,6 +452,7 @@ func (m *module) handleDriverMQTTPacket(msgTopic string, payloadBytes []byte, no
 					}
 					if st.APower != nil {
 						plug.PowerWatts = st.APower
+						plug.meterAt = now
 					}
 					if st.Voltage != nil {
 						plug.Voltage = st.Voltage
@@ -452,6 +495,7 @@ func (m *module) handleDriverMQTTPacket(msgTopic string, payloadBytes []byte, no
 					}
 					if v, ok := extractFloat(obj["power"]); ok {
 						plug.PowerWatts = &v
+						plug.meterAt = now
 					}
 					if v, ok := extractFloat(obj["voltage"]); ok {
 						plug.Voltage = &v
@@ -510,21 +554,22 @@ func (m *module) handleDriverMQTTPacket(msgTopic string, payloadBytes []byte, no
 				}
 				handled = true
 			} else if msgTopic == name+"/power/get" {
-				if w, err := strconv.ParseFloat(payload, 64); err == nil {
+				if w, ok := parseReading(payload); ok {
 					plug := m.ensureDriverPlugLocked(key, d, name)
 					plug.PowerWatts = &w
+					plug.meterAt = now
 					plug.UpdatedAt = &now
 					handled = true
 				}
 			} else if msgTopic == name+"/voltage/get" {
-				if v, err := strconv.ParseFloat(payload, 64); err == nil {
+				if v, ok := parseReading(payload); ok {
 					plug := m.ensureDriverPlugLocked(key, d, name)
 					plug.Voltage = &v
 					plug.UpdatedAt = &now
 					handled = true
 				}
 			} else if msgTopic == name+"/current/get" {
-				if a, err := strconv.ParseFloat(payload, 64); err == nil {
+				if a, ok := parseReading(payload); ok {
 					plug := m.ensureDriverPlugLocked(key, d, name)
 					plug.CurrentAmps = &a
 					plug.UpdatedAt = &now
@@ -580,11 +625,13 @@ func (m *module) handleDriverMQTTPacket(msgTopic string, payloadBytes []byte, no
 					if json.Unmarshal(payloadBytes, &obj) == nil {
 						if w, ok := extractFloat(obj[cfg.MQTTPowerJSONKey]); ok {
 							plug.PowerWatts = &w
+							plug.meterAt = now
 							plug.UpdatedAt = &now
 						}
 					}
-				} else if w, err := strconv.ParseFloat(payload, 64); err == nil {
+				} else if w, ok := parseReading(payload); ok {
 					plug.PowerWatts = &w
+					plug.meterAt = now
 					plug.UpdatedAt = &now
 				}
 				handled = true
@@ -593,6 +640,23 @@ func (m *module) handleDriverMQTTPacket(msgTopic string, payloadBytes []byte, no
 	}
 	return handled
 }
+
+// shellyProtection is the protection a Shelly Gen2+ switch names in the
+// errors of its status, the gravest first, or nothing.
+func shellyProtection(faults []string) string {
+	for _, kind := range []string{protectOvertemp, protectOverpower, protectOvervoltage, protectUndervoltage} {
+		for _, fault := range faults {
+			if strings.EqualFold(strings.TrimSpace(fault), kind) {
+				return kind
+			}
+		}
+	}
+	return ""
+}
+
+// shellyWifiEvery is how often a Shelly read by address is asked for its
+// Wi-Fi signal.
+const shellyWifiEvery = time.Minute
 
 func (m *module) ensureDriverPlugLocked(key, driver, friendly string) *PlugTelemetry {
 	plug, ok := m.plugs[key]
@@ -666,6 +730,18 @@ func normalizeGenericBoolState(raw string) (string, bool) {
 	}
 }
 
+// parseReading reads a number a plug reported as text. "nan" and "inf" parse
+// as numbers, and are what some firmware sends for a sensor with no value.
+// They are no reading: a sum that took one in would never be a number again,
+// and JSON cannot hold them.
+func parseReading(text string) (float64, bool) {
+	f, err := strconv.ParseFloat(strings.TrimSpace(text), 64)
+	if err != nil || math.IsNaN(f) || math.IsInf(f, 0) {
+		return 0, false
+	}
+	return f, true
+}
+
 func extractFloat(v any) (float64, bool) {
 	switch n := v.(type) {
 	case float64:
@@ -673,8 +749,7 @@ func extractFloat(v any) (float64, bool) {
 	case int:
 		return float64(n), true
 	case string:
-		f, err := strconv.ParseFloat(strings.TrimSpace(n), 64)
-		return f, err == nil
+		return parseReading(n)
 	default:
 		return 0, false
 	}
@@ -857,6 +932,9 @@ func (m *module) shellyHTTPRequest(ctx context.Context, cfg DeviceConfig, pathAn
 		return 0, nil, err
 	}
 	defer resp.Body.Close()
+	if isRedirect(resp.StatusCode) {
+		return resp.StatusCode, nil, redirectError("Shelly plug", resp.StatusCode)
+	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 256<<10))
 	if err != nil {
 		return resp.StatusCode, nil, err
@@ -880,6 +958,7 @@ func (m *module) pollShellyHTTPPlug(ctx context.Context, cfg DeviceConfig) error
 			APower  *float64 `json:"apower"`
 			Voltage *float64 `json:"voltage"`
 			Current *float64 `json:"current"`
+			Errors  []string `json:"errors"`
 		}
 		if json.Unmarshal(raw, &gen2) == nil && gen2.Output != nil {
 			now := time.Now()
@@ -896,6 +975,7 @@ func (m *module) pollShellyHTTPPlug(ctx context.Context, cfg DeviceConfig) error
 			plug.setRelayState(relay, state)
 			if gen2.APower != nil {
 				plug.PowerWatts = gen2.APower
+				plug.meterAt = now
 			}
 			if gen2.Voltage != nil {
 				plug.Voltage = gen2.Voltage
@@ -903,7 +983,41 @@ func (m *module) pollShellyHTTPPlug(ctx context.Context, cfg DeviceConfig) error
 			if gen2.Current != nil {
 				plug.CurrentAmps = gen2.Current
 			}
+			plug.setProtection(relay, shellyProtection(gen2.Errors))
+			asked := m.clock()
+			askWifi := plug.wifiAt.IsZero() || asked.Sub(plug.wifiAt) >= shellyWifiEvery || asked.Before(plug.wifiAt)
+			if askWifi {
+				plug.wifiAt = asked
+			}
 			m.mu.Unlock()
+
+			// The signal and what the relay does after a power cut are two
+			// more questions to the same plug. They are asked once a minute,
+			// and an answer that does not come changes nothing.
+			if askWifi {
+				var relayCfg struct {
+					InitialState string `json:"initial_state"`
+				}
+				cfgStatus, cfgRaw, cfgErr := m.shellyHTTPRequest(ctx, cfg, fmt.Sprintf("/rpc/Switch.GetConfig?id=%d", zeroIdx))
+				if cfgErr == nil && cfgStatus >= 200 && cfgStatus < 300 && json.Unmarshal(cfgRaw, &relayCfg) == nil {
+					m.mu.Lock()
+					if held := m.plugs[key]; held != nil {
+						held.setAfterPowerCut(relay, shellyGen2AfterPowerCut(relayCfg.InitialState))
+					}
+					m.mu.Unlock()
+				}
+				var wifi struct {
+					RSSI *float64 `json:"rssi"`
+				}
+				wifiStatus, wifiRaw, wifiErr := m.shellyHTTPRequest(ctx, cfg, "/rpc/Wifi.GetStatus")
+				if wifiErr == nil && wifiStatus >= 200 && wifiStatus < 300 && json.Unmarshal(wifiRaw, &wifi) == nil && wifi.RSSI != nil {
+					m.mu.Lock()
+					if held := m.plugs[key]; held != nil {
+						held.setWifi(*wifi.RSSI)
+					}
+					m.mu.Unlock()
+				}
+			}
 			return nil
 		}
 	}
@@ -920,6 +1034,10 @@ func (m *module) pollShellyHTTPPlug(ctx context.Context, cfg DeviceConfig) error
 				Meters []struct {
 					Power float64 `json:"power"`
 				} `json:"meters"`
+				Overtemperature bool `json:"overtemperature"`
+				WifiSta         struct {
+					RSSI *float64 `json:"rssi"`
+				} `json:"wifi_sta"`
 			}
 			if json.Unmarshal(raw, &gen1) == nil && len(gen1.Relays) > zeroIdx {
 				now := time.Now()
@@ -937,14 +1055,46 @@ func (m *module) pollShellyHTTPPlug(ctx context.Context, cfg DeviceConfig) error
 				plug.setRelayState(relay, state)
 				if r.Overpower {
 					plug.LastError = "overpower protection triggered"
+					plug.setProtection(relay, protectOverpower)
 				} else {
 					plug.LastError = ""
+					plug.setProtection(relay, "")
+				}
+				if gen1.Overtemperature {
+					plug.setProtection(0, protectOvertemp)
+				} else if plug.protections[0] == protectOvertemp {
+					plug.setProtection(0, "")
+				}
+				if gen1.WifiSta.RSSI != nil {
+					plug.setWifi(*gen1.WifiSta.RSSI)
 				}
 				if len(gen1.Meters) > zeroIdx {
 					w := gen1.Meters[zeroIdx].Power
 					plug.PowerWatts = &w
+					plug.meterAt = now
+				}
+				asked := m.clock()
+				askSettings := plug.wifiAt.IsZero() || asked.Sub(plug.wifiAt) >= shellyWifiEvery || asked.Before(plug.wifiAt)
+				if askSettings {
+					plug.wifiAt = asked
 				}
 				m.mu.Unlock()
+
+				// What the relay does after a power cut is in its settings, a
+				// second question that is asked once a minute.
+				if askSettings {
+					var relaySettings struct {
+						DefaultState string `json:"default_state"`
+					}
+					setStatus, setRaw, setErr := m.shellyHTTPRequest(ctx, cfg, fmt.Sprintf("/settings/relay/%d", zeroIdx))
+					if setErr == nil && setStatus >= 200 && setStatus < 300 && json.Unmarshal(setRaw, &relaySettings) == nil {
+						m.mu.Lock()
+						if held := m.plugs[key]; held != nil {
+							held.setAfterPowerCut(relay, shellyGen1AfterPowerCut(relaySettings.DefaultState))
+						}
+						m.mu.Unlock()
+					}
+				}
 				return nil
 			}
 		}
@@ -1070,6 +1220,9 @@ func (m *module) haHTTPRequest(ctx context.Context, s Settings, method, apiPath 
 		return 0, nil, err
 	}
 	defer resp.Body.Close()
+	if isRedirect(resp.StatusCode) {
+		return resp.StatusCode, nil, redirectError("Home Assistant", resp.StatusCode)
+	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
 	if err != nil {
 		return resp.StatusCode, nil, err
@@ -1087,11 +1240,10 @@ func (m *module) testHomeAssistant(ctx context.Context, override *Settings) (boo
 	saved := m.settings()
 	candidate := saved
 	if override != nil {
-		candidate = *override
-		if candidate.HAToken == "" && candidate.KeepHAToken {
-			candidate.HAToken = saved.HAToken
+		candidate = m.applyHostPins(*override)
+		if err := keepHAToken(*override, saved, &candidate); err != nil {
+			return false, normalizeBaseURL(candidate.HAURL), nil, err.Error()
 		}
-		candidate = m.applyHostPins(candidate)
 	}
 	base := normalizeBaseURL(candidate.HAURL)
 	if base == "" {
@@ -1144,6 +1296,33 @@ func (m *module) fetchHAEntities(ctx context.Context, s Settings) ([]HAEntity, e
 	return out, nil
 }
 
+// errUnsupportedHAEntity is the refusal for an entity the extension does not
+// switch or read, such as a cover, lock, alarm, script or automation.
+var errUnsupportedHAEntity = errors.New("unsupported Home Assistant entity (use a switch, input_boolean, light or fan, and a sensor for power)")
+
+// validHAEntity reports whether id is an entity the extension may act on: a
+// switch, input_boolean, light or fan, or with power a sensor. The ids the
+// entity picker offers are of these domains.
+func validHAEntity(id string, power bool) bool {
+	domain, object, ok := strings.Cut(id, ".")
+	if !ok || object == "" {
+		return false
+	}
+	for _, c := range object {
+		if (c < 'a' || c > 'z') && (c < '0' || c > '9') && c != '_' {
+			return false
+		}
+	}
+	if power {
+		return domain == "sensor"
+	}
+	switch domain {
+	case "switch", "input_boolean", "light", "fan":
+		return true
+	}
+	return false
+}
+
 func (m *module) pollHomeAssistantPlug(ctx context.Context, cfg DeviceConfig) error {
 	entityID := strings.TrimSpace(cfg.HAEntityID)
 	if entityID == "" {
@@ -1152,7 +1331,13 @@ func (m *module) pollHomeAssistantPlug(ctx context.Context, cfg DeviceConfig) er
 	key := cfg.plugKey()
 	s := m.settings()
 
-	_, raw, err := m.haHTTPRequest(ctx, s, http.MethodGet, "/api/states/"+url.PathEscape(entityID), nil)
+	var raw []byte
+	var err error
+	if validHAEntity(entityID, false) {
+		_, raw, err = m.haHTTPRequest(ctx, s, http.MethodGet, "/api/states/"+url.PathEscape(entityID), nil)
+	} else {
+		err = errUnsupportedHAEntity
+	}
 	if err != nil {
 		m.mu.Lock()
 		plug := m.ensureDriverPlugLocked(key, DriverHomeAssistant, entityID)
@@ -1173,14 +1358,21 @@ func (m *module) pollHomeAssistantPlug(ctx context.Context, cfg DeviceConfig) er
 		return fmt.Errorf("invalid Home Assistant state JSON: %w", err)
 	}
 
+	// The sensor is asked on every poll, so a poll without a reading (the
+	// sensor is unavailable, or its request failed) leaves no reading. The
+	// last one must not stand: energy would go on counting from it.
 	var wattsPtr *float64
-	if pEnt := strings.TrimSpace(cfg.HAPowerEntityID); pEnt != "" {
+	pEnt := strings.TrimSpace(cfg.HAPowerEntityID)
+	if pEnt != "" && validHAEntity(pEnt, true) {
 		if _, pRaw, pErr := m.haHTTPRequest(ctx, s, http.MethodGet, "/api/states/"+url.PathEscape(pEnt), nil); pErr == nil {
 			var pSt struct {
-				State string `json:"state"`
+				State      string `json:"state"`
+				Attributes struct {
+					Unit string `json:"unit_of_measurement"`
+				} `json:"attributes"`
 			}
 			if json.Unmarshal(pRaw, &pSt) == nil {
-				if w, parseErr := strconv.ParseFloat(strings.TrimSpace(pSt.State), 64); parseErr == nil {
+				if w, ok := haPowerWatts(pSt.State, pSt.Attributes.Unit); ok {
 					wattsPtr = &w
 				}
 			}
@@ -1206,15 +1398,44 @@ func (m *module) pollHomeAssistantPlug(ctx context.Context, cfg DeviceConfig) er
 	}
 	if wattsPtr != nil {
 		plug.PowerWatts = wattsPtr
+		plug.meterAt = now
+	} else if pEnt != "" {
+		plug.PowerWatts = nil
 	}
 	m.mu.Unlock()
 	return nil
+}
+
+// haPowerWatts reads a Home Assistant power sensor's state in watts. The
+// sensor says its own unit; one without a unit is taken as watts. A state
+// that is no number ("unavailable", "unknown"), and a unit that is no power
+// unit, give no reading.
+func haPowerWatts(state, unit string) (float64, bool) {
+	v, err := strconv.ParseFloat(strings.TrimSpace(state), 64)
+	if err != nil || math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0, false
+	}
+	switch strings.TrimSpace(unit) {
+	case "", "W":
+		return v, true
+	case "kW":
+		return v * 1000, true
+	case "MW":
+		return v * 1e6, true
+	case "mW":
+		return v / 1000, true
+	default:
+		return 0, false
+	}
 }
 
 func (m *module) switchHomeAssistantPlugVerified(ctx context.Context, cfg DeviceConfig, wantOn bool) error {
 	entityID := strings.TrimSpace(cfg.HAEntityID)
 	if entityID == "" {
 		return errors.New("Home Assistant entity_id is required")
+	}
+	if !validHAEntity(entityID, false) {
+		return errUnsupportedHAEntity
 	}
 	s := m.settings()
 	service := "turn_off"

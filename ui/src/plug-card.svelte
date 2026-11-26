@@ -14,12 +14,18 @@
   } from '@prusa/connect-ui/primitives';
   import { printerHref } from '@prusa/connect-ui/shell';
 
-  import { formatEnergy, formatSpan, formatWatts } from './format';
+  import {
+    formatCountdown,
+    formatEnergy,
+    formatSpan,
+    formatWatts,
+  } from './format';
   import { heldHost } from './host';
   import PlugBadge from './plug-badge.svelte';
   import { artworkOf, plugLineOf } from './plug-line';
   import PowerButtons from './power-buttons.svelte';
   import { powerFor } from './power.svelte';
+  import { tripped } from './signal';
   import type { PlugListRow } from './summary';
 
   let {
@@ -45,6 +51,10 @@
 
   const config = $derived(row.entry?.config);
   const session = $derived(row.entry?.session_usage);
+  /** Seconds until the idle turn-off, while its clock runs on a plug that is on. */
+  const idleLeft = $derived(
+    row.state === 'on' ? row.entry?.idle_off_remaining_sec : undefined,
+  );
 </script>
 
 <Card density="compact" class="h-full" data-printer={row.id}>
@@ -68,8 +78,18 @@
       </div>
       <div class="flex shrink-0 flex-col items-end gap-1">
         <PlugBadge plugState={row.state} />
+        {#if tripped(row.entry?.plug)}
+          <Badge variant="destructive" data-part="protection">
+            {t('power.protection.badge')}
+          </Badge>
+        {/if}
         {#if config?.auto_off_after_print}
           <Badge variant="outline">{t('power.page.autoOff')}</Badge>
+        {/if}
+        {#if idleLeft !== undefined}
+          <Badge variant="outline" data-part="idle-off">
+            {t('power.page.idleOff', { span: formatCountdown(idleLeft) })}
+          </Badge>
         {/if}
       </div>
     </div>

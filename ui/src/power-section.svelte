@@ -1,7 +1,8 @@
 <!--
   The Power Control section of a printer's page: what the plug is doing, the
   buttons that switch it, the choice to cut the power after a print, and what
-  the printer drew.
+  the printer drew, with what that cost when a price is set. The process
+  prices every figure by the rule of the Energy tab.
 
   A printer with no plug, a plug whose connection is missing and a plug that
   does not answer are each said in their own words, with a link to where a
@@ -13,6 +14,7 @@
     AlertDescription,
     AlertTitle,
     Badge,
+    Button,
     Card,
     CardContent,
     DataRow,
@@ -38,6 +40,8 @@
   import FaultNote from './fault-note.svelte';
   import {
     formatAmps,
+    formatCost,
+    formatCountdown,
     formatEnergy,
     formatSpan,
     formatVolts,
@@ -45,12 +49,13 @@
   } from './format';
   import { heldHost } from './host';
   import LinkButton from './link-button.svelte';
-  import { settingsTabHref } from './links';
+  import { energyHref, settingsTabHref } from './links';
   import PlugBadge from './plug-badge.svelte';
   import { plugStateOf } from './plug-state';
   import PowerButtons from './power-buttons.svelte';
   import PowerChart from './power-chart.svelte';
   import { powerFor } from './power.svelte';
+  import { protectionText, signalOfPlug, tripped } from './signal';
 
   interface Props {
     deviceId: string;
@@ -79,6 +84,8 @@
   const driver = $derived(effectiveDriver(config));
   const transport = $derived(transportOf(driver));
   const plugState = $derived(plugStateOf(config, plug));
+  const signal = $derived(signalOfPlug(t, plug, plugState));
+  const protection = $derived(protectionText(t, plug));
 
   /** Why the plug cannot be used at all, or undefined when it can. */
   const blocked = $derived.by(
@@ -164,6 +171,36 @@
       peak: formatWatts(record.peak_watts),
     });
 
+  /** What a record cost, undefined with no price or for one not priced. */
+  const costOf = (record: { cost?: number | null }): string | undefined =>
+    status?.price_set === true && record.cost != null
+      ? formatCost(record.cost, status.currency ?? '')
+      : undefined;
+
+  /** A record's energy, with its cost beside it when it has one. */
+  const amountOf = (record: {
+    energy_wh: number;
+    cost?: number | null;
+  }): string => {
+    const energy = formatEnergy(record.energy_wh);
+    const cost = costOf(record);
+
+    return cost === undefined
+      ? energy
+      : t('power.section.energyCost', { energy, cost });
+  };
+
+  /** The line under a recent print: energy, cost when priced, and usage. */
+  const recentOf = (record: PrintPowerRecord): string[] => {
+    const cost = costOf(record);
+
+    return [
+      formatEnergy(record.energy_wh),
+      ...(cost === undefined ? [] : [cost]),
+      usageOf(record),
+    ];
+  };
+
   const printKey = (record: PrintPowerRecord): string =>
     `${record.started_at} ${record.file_name}`;
 
@@ -195,6 +232,19 @@
     fault = undefined;
     try {
       status = await power.setAutoOff(deviceId, enabled);
+    } catch (thrown) {
+      fault = thrown;
+    } finally {
+      busy = false;
+    }
+  };
+
+  /** Starts the idle wait again. The answer is the printer's new status. */
+  const keepOn = async (): Promise<void> => {
+    busy = true;
+    fault = undefined;
+    try {
+      status = await power.keepOn(deviceId);
     } catch (thrown) {
       fault = thrown;
     } finally {
@@ -255,6 +305,14 @@
               {reading}
             </span>
           {/if}
+          {#if signal !== undefined}
+            <span
+              class="text-muted-foreground text-xs tabular-nums"
+              data-part="signal"
+            >
+              {t('power.plugs.fact.signal')}: {signal}
+            </span>
+          {/if}
         </div>
         <PowerButtons
           {deviceId}
@@ -272,6 +330,15 @@
           <AlertTitle>{t('power.section.offline')}</AlertTitle>
           {#if plug?.last_error}
             <AlertDescription>{plug.last_error}</AlertDescription>
+          {/if}
+        </Alert>
+      {/if}
+
+      {#if tripped(plug)}
+        <Alert variant="destructive" data-part="protection">
+          <AlertTitle>{t('power.protection.title')}</AlertTitle>
+          {#if protection !== undefined}
+            <AlertDescription>{protection}</AlertDescription>
           {/if}
         </Alert>
       {/if}
@@ -314,6 +381,25 @@
               </Badge>
             {/if}
           {/if}
+          {#if status.idle_off_pending && !status.auto_off_pending}
+            <Badge variant="info" data-part="idle-off">
+              {t('power.section.idleOffIn', {
+                span: formatCountdown(status.idle_off_remaining_sec ?? 0),
+              })}
+            </Badge>
+            {#if power.mayOperate(deviceId)}
+              <Button
+                size="sm"
+                variant="secondary"
+                aria-label={t('power.section.idleKeepOf', { printer })}
+                disabled={busy}
+                onclick={() => void keepOn()}
+                data-part="idle-keep"
+              >
+                {t('power.section.idleKeep')}
+              </Button>
+            {/if}
+          {/if}
           {#if keptText !== ''}
             <Badge variant="outline" data-part="auto-off-kept">{keptText}</Badge
             >
@@ -333,6 +419,13 @@
         </Alert>
       {/if}
 
+      {#if status.idle_off_error}
+        <Alert variant="destructive" data-part="idle-off-failed">
+          <AlertTitle>{t('power.section.idleOffFailed')}</AlertTitle>
+          <AlertDescription>{status.idle_off_error}</AlertDescription>
+        </Alert>
+      {/if}
+
       <div class="grid grid-cols-1 gap-3 sm:grid-cols-2">
         <StatusCard
           edge
@@ -341,7 +434,7 @@
           title={session?.active
             ? t('power.section.session.now')
             : t('power.section.session.last')}
-          value={session ? formatEnergy(session.energy_wh) : undefined}
+          value={session ? amountOf(session) : undefined}
           caption={session ? usageOf(session) : t('power.section.session.none')}
         />
         <StatusCard
@@ -351,7 +444,7 @@
           title={print?.active
             ? t('power.section.print.now')
             : t('power.section.print.last')}
-          value={print ? formatEnergy(print.energy_wh) : undefined}
+          value={print ? amountOf(print) : undefined}
           caption={print
             ? t('power.section.print.of', {
                 file: print.file_name,
@@ -399,15 +492,18 @@
               <DataRow
                 mono
                 primary={record.file_name}
-                secondaryValues={[
-                  formatEnergy(record.energy_wh),
-                  usageOf(record),
-                ]}
+                secondaryValues={recentOf(record)}
               />
             {/each}
           </RowList>
         </div>
       {/if}
+
+      <div class="text-sm" data-part="history-link">
+        <LinkButton href={energyHref(host, deviceId)}>
+          {t('power.section.history')}
+        </LinkButton>
+      </div>
     {/if}
   </CardContent>
 </Card>

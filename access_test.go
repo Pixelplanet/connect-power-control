@@ -66,9 +66,11 @@ var guardedRoutes = []routeCase{
 	{"POST", "/ha/test", `{}`, mayConfigure},
 	{"POST", "/discover", ``, mayConfigure},
 	{"GET", "/assignments", ``, mayConfigure},
+	{"PUT", "/energy/settings", `{}`, mayConfigure},
 	{"PUT", "/devices/p1/config", `{}`, mayConfigureDevice},
 	{"POST", "/devices/p1/power", `{"action":"on"}`, mayOperate},
 	{"POST", "/devices/p1/auto-off", `{"enabled":true}`, mayOperate},
+	{"POST", "/devices/p1/idle-off", `{"action":"keep"}`, mayOperate},
 }
 
 func serve(m *module, method, path, body string) *httptest.ResponseRecorder {
@@ -383,5 +385,22 @@ func TestTheOverviewSaysWhatAPersonMayChange(t *testing.T) {
 	failing.mayHint(context.Background(), "user:x", mayOperate, "p1")
 	if len(down.asked()) != before {
 		t.Fatal("a failed hint was asked again at once")
+	}
+}
+
+// Keeping an idle printer on takes the one action there is.
+func TestKeepingAPrinterOnTakesTheKeepAction(t *testing.T) {
+	access := &accessFake{allow: map[string]bool{actionOperate: true, actionOperateResource: true}}
+	m := guardedModule(t, "user:operator", access)
+	m.configs["p1"] = normalizeDeviceConfig(DeviceConfig{Driver: DriverTasmota, TasmotaTopic: "plug"})
+
+	for _, body := range []string{`{"action":"off"}`, `{}`, `{"action":""}`} {
+		rec := serve(m, "POST", "/devices/p1/idle-off", body)
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("%s: status %d, want 400: %s", body, rec.Code, rec.Body.String())
+		}
+		if code := problemCode(t, rec); !strings.HasSuffix(code, "INVALID_INPUT") {
+			t.Fatalf("%s: code %q, want INVALID_INPUT", body, code)
+		}
 	}
 }

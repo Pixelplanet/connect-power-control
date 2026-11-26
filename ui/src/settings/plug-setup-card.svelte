@@ -6,6 +6,9 @@
 -->
 <script lang="ts">
   import {
+    Alert,
+    AlertDescription,
+    Badge,
     Button,
     Card,
     CardContent,
@@ -26,6 +29,7 @@
   import PlugBadge from '../plug-badge.svelte';
   import { artworkOf } from '../plug-line';
   import { plugStateOf, wattsNow } from '../plug-state';
+  import { afterCutOfPlug, alwaysOn, signalOfPlug, tripped } from '../signal';
 
   let {
     id,
@@ -57,9 +61,19 @@
   const driver = $derived(effectiveDriver(config));
   const has = $derived(driver !== '' && isDeviceConfigured(config));
   const relay = $derived(relayIndexOf(config));
+  const signal = $derived(signalOfPlug(t, plug, plugState));
+  const afterCut = $derived(afterCutOfPlug(t, plug, plugState));
+  const stuckOn = $derived(alwaysOn(plug, plugState));
+
+  /** One line of the card. `part` names the line for a test. */
+  interface Fact {
+    label: string;
+    value: string;
+    part?: string;
+  }
 
   /** What the card says about the plug, one fact a line. */
-  const facts = $derived.by((): { label: string; value: string }[] => {
+  const facts = $derived.by((): Fact[] => {
     if (!has || driver === '') return [];
 
     return [
@@ -82,6 +96,24 @@
         value:
           watts === undefined ? t('power.page.noReading') : formatWatts(watts),
       },
+      ...(signal === undefined
+        ? []
+        : [
+            {
+              label: t('power.plugs.fact.signal'),
+              value: signal,
+              part: 'signal',
+            },
+          ]),
+      ...(afterCut === undefined
+        ? []
+        : [
+            {
+              label: t('power.plugs.fact.afterCut'),
+              value: afterCut,
+              part: 'after-cut',
+            },
+          ]),
     ];
   });
 </script>
@@ -96,14 +128,24 @@
       />
       <div class="flex min-w-0 flex-1 flex-col gap-1">
         <span class="truncate text-sm font-semibold">{name}</span>
-        <span><PlugBadge {plugState} /></span>
+        <span class="flex flex-wrap items-center gap-2">
+          <PlugBadge {plugState} />
+          {#if tripped(plug)}
+            <Badge variant="destructive" data-part="protection">
+              {t('power.protection.badge')}
+            </Badge>
+          {/if}
+        </span>
       </div>
     </div>
 
     {#if has}
       <dl class="flex flex-col gap-1 text-sm">
         {#each facts as fact (fact.label)}
-          <div class="flex items-start justify-between gap-3">
+          <div
+            class="flex items-start justify-between gap-3"
+            data-part={fact.part}
+          >
             <dt class="text-muted-foreground shrink-0 text-xs">
               {fact.label}
             </dt>
@@ -113,6 +155,12 @@
           </div>
         {/each}
       </dl>
+      {#if stuckOn}
+        <Alert variant="warning" data-part="always-on">
+          <AlertDescription>{t('power.afterCut.alwaysOnNote')}</AlertDescription
+          >
+        </Alert>
+      {/if}
     {:else}
       <p class="text-muted-foreground text-sm" data-part="no-plug-note">
         {t('power.plugs.noneNote')}

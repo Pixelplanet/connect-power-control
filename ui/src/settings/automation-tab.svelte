@@ -1,6 +1,10 @@
 <!--
-  The Automation tab: when a plug cuts the power by itself. The first pane
-  holds the rules for every printer, the second each printer's own choice.
+  The Automation tab: when a plug cuts the power by itself, after a print or
+  after a printer was left on and idle. The first pane holds the rules for
+  every printer, the second each printer's own choice. The idle time is
+  typed in hours and saved in minutes.
+  The third holds what the Energy view counts with: how long records are
+  kept, the time zone, the currency and the price.
 
   A settings pane takes no props, and the host draws it with no heading, so
   each pane names itself.
@@ -29,10 +33,11 @@
   import RightsNote from '../rights-note.svelte';
   import { formatSpan } from '../format';
   import { heldHost } from '../host';
-  import { typed, wholeOf } from '../input';
+  import { decimalOf, typed, wholeOf } from '../input';
   import LinkButton from '../link-button.svelte';
   import { settingsTabHref } from '../links';
   import { powerFor } from '../power.svelte';
+  import EnergySettings from './energy-settings.svelte';
   import { PANE_BODY } from './pane-body';
   import SettingRow from './setting-row.svelte';
 
@@ -46,8 +51,30 @@
   /** What is typed for the rules, undefined while a field shows what is saved. */
   let delayText = $state<string | undefined>(undefined);
   let confirmChoice = $state<boolean | undefined>(undefined);
+  let idleText = $state<string | undefined>(undefined);
   /** What is typed for one printer's own delay, by printer. */
   let ownDelays = $state<Record<string, string>>({});
+  /** What is typed for one printer's own idle time, by printer. */
+  let ownIdles = $state<Record<string, string>>({});
+
+  /** Minutes as the hours a field shows. No time at all shows as empty. */
+  const hoursOf = (minutes: number): string =>
+    minutes <= 0 ? '' : String(Math.round((minutes / 60) * 100) / 100);
+
+  /**
+   * The minutes a typed number of hours stands for: 0 for an empty field,
+   * `fallback` for what is not a number.
+   */
+  const minutesOf = (text: string, fallback: number): number => {
+    if (text.trim() === '') return 0;
+    const hours = decimalOf(text);
+
+    return hours === undefined ? fallback : Math.round(hours * 60);
+  };
+
+  /** A typed idle time that is neither empty nor a number. */
+  const badHours = (text: string | undefined): boolean =>
+    text !== undefined && text.trim() !== '' && decimalOf(text) === undefined;
 
   let saving = $state(false);
   let busyPrinter = $state('');
@@ -65,10 +92,16 @@
   const savedDelay = $derived(saved?.auto_off_cooldown_sec ?? DEFAULT_DELAY);
   const delay = $derived(delayText ?? String(savedDelay));
   const confirm = $derived(confirmChoice ?? saved?.confirm_turn_off ?? true);
+  const savedIdle = $derived(saved?.idle_off_min ?? 0);
+  const idle = $derived(idleText ?? hoursOf(savedIdle));
+  const idleInvalid = $derived(badHours(idleText));
   const dirty = $derived(
     saved !== undefined &&
+      !idleInvalid &&
       (wholeOf(delay, savedDelay) !== savedDelay ||
-        confirm !== saved.confirm_turn_off),
+        confirm !== saved.confirm_turn_off ||
+        (idleText !== undefined &&
+          minutesOf(idleText, savedIdle) !== savedIdle)),
   );
 
   const printers = $derived(
@@ -83,6 +116,14 @@
   const savedOwn = (config: DeviceConfig | undefined): string =>
     config?.cooldown_sec === undefined ? '' : String(config.cooldown_sec);
 
+  /** A printer's own idle time in hours: '' for none, '0' for never. */
+  const savedOwnIdle = (config: DeviceConfig | undefined): string => {
+    const minutes = config?.idle_off_min;
+    if (minutes === undefined) return '';
+
+    return minutes <= 0 ? '0' : hoursOf(minutes);
+  };
+
   const saveRules = async (event: SubmitEvent): Promise<void> => {
     event.preventDefault();
     saving = true;
@@ -92,9 +133,11 @@
       await power.saveSettings({
         auto_off_cooldown_sec: wholeOf(delay, savedDelay),
         confirm_turn_off: confirm,
+        idle_off_min: minutesOf(idle, savedIdle),
       });
       delayText = undefined;
       confirmChoice = undefined;
+      idleText = undefined;
       justSaved = true;
     } catch (thrown) {
       fault = thrown;
@@ -155,6 +198,46 @@
       );
     }
   };
+
+  const forgetOwnIdle = (deviceId: string): void => {
+    ownIdles = Object.fromEntries(
+      Object.entries(ownIdles).filter(([id]) => id !== deviceId),
+    );
+  };
+
+  /** Takes a printer's own idle time away, so the global one counts again. */
+  const useGeneralIdle = async (
+    deviceId: string,
+    config: DeviceConfig,
+  ): Promise<void> => {
+    const done = await change(deviceId, () =>
+      power.saveConfig(
+        deviceId,
+        withAutoOff(config, { idle_off_min: undefined }),
+      ),
+    );
+    if (done) forgetOwnIdle(deviceId);
+  };
+
+  /** An empty field takes the own time away. A zero keeps the printer on. */
+  const saveOwnIdle = async (
+    deviceId: string,
+    config: DeviceConfig,
+  ): Promise<void> => {
+    const text = (ownIdles[deviceId] ?? '').trim();
+    const done = await change(deviceId, () =>
+      power.saveConfig(
+        deviceId,
+        withAutoOff(config, {
+          idle_off_min:
+            text === ''
+              ? undefined
+              : minutesOf(text, config.idle_off_min ?? savedIdle),
+        }),
+      ),
+    );
+    if (done) forgetOwnIdle(deviceId);
+  };
 </script>
 
 <div class="flex flex-col gap-6">
@@ -209,6 +292,34 @@
               />
             {/snippet}
           </SettingRow>
+          <SettingRow
+            id={`${uid}-idle`}
+            label={t('power.automation.idle.label')}
+            description={t('power.automation.idle.hint')}
+          >
+            {#snippet control()}
+              <div class="w-24" data-part="idle-hours">
+                <Input
+                  type="text"
+                  inputmode="decimal"
+                  autocomplete="off"
+                  aria-labelledby={`${uid}-idle-label`}
+                  aria-describedby={`${uid}-idle-description`}
+                  aria-invalid={idleInvalid}
+                  value={idle}
+                  oninput={typed((value) => (idleText = value))}
+                />
+              </div>
+              <span class="text-muted-foreground text-sm">
+                {t('power.automation.hours')}
+              </span>
+            {/snippet}
+          </SettingRow>
+          {#if idleInvalid}
+            <p class="text-muted-foreground text-xs" data-part="idle-invalid">
+              {t('power.automation.idle.invalid')}
+            </p>
+          {/if}
           {#if justSaved}
             <Alert variant="success" data-part="saved">
               <AlertDescription>{t('power.connections.saved')}</AlertDescription
@@ -248,6 +359,7 @@
               <TableHead>{t('power.automation.printers.printer')}</TableHead>
               <TableHead>{t('power.automation.printers.autoOff')}</TableHead>
               <TableHead>{t('power.automation.printers.delay')}</TableHead>
+              <TableHead>{t('power.automation.printers.idle')}</TableHead>
             </TableRow>
           </TableHeader>
           <TableBody>
@@ -255,6 +367,7 @@
               {@const name = printer.name || printer.id}
               {@const config = configFor(printer.id)}
               {@const typedDelay = ownDelays[printer.id]}
+              {@const typedIdle = ownIdles[printer.id]}
               <TableRow data-printer={printer.id}>
                 <TableCell class="font-medium">{name}</TableCell>
                 {#if config !== undefined && isDeviceConfigured(config)}
@@ -320,8 +433,75 @@
                       {/if}
                     </div>
                   </TableCell>
+                  <TableCell data-part="own-idle">
+                    <div class="flex flex-wrap items-center gap-2">
+                      <div class="w-20">
+                        <Input
+                          size="sm"
+                          type="text"
+                          inputmode="decimal"
+                          autocomplete="off"
+                          aria-label={t('power.automation.printers.idleOf', {
+                            printer: name,
+                          })}
+                          aria-invalid={badHours(typedIdle)}
+                          placeholder={hoursOf(savedIdle)}
+                          value={typedIdle ?? savedOwnIdle(config)}
+                          oninput={typed(
+                            (value) => (ownIdles[printer.id] = value),
+                          )}
+                        />
+                      </div>
+                      <span class="text-muted-foreground text-sm">
+                        {t('power.automation.hours')}
+                      </span>
+                      {#if typedIdle !== undefined && typedIdle.trim() !== savedOwnIdle(config)}
+                        <Button
+                          size="sm"
+                          disabled={badHours(typedIdle)}
+                          pending={busyPrinter === printer.id}
+                          onclick={() => void saveOwnIdle(printer.id, config)}
+                        >
+                          {t('power.connections.save')}
+                        </Button>
+                      {:else if config.idle_off_min === undefined}
+                        <span
+                          class="text-muted-foreground text-xs"
+                          data-part="general-idle"
+                        >
+                          {t('power.automation.printers.idleGeneral')}
+                        </span>
+                      {:else}
+                        <Button
+                          size="sm"
+                          variant="ghost"
+                          disabled={busyPrinter === printer.id}
+                          onclick={() =>
+                            void useGeneralIdle(printer.id, config)}
+                        >
+                          {t('power.automation.printers.idleUseGeneral')}
+                        </Button>
+                      {/if}
+                    </div>
+                    {#if badHours(typedIdle)}
+                      <p
+                        class="text-muted-foreground pt-1 text-xs"
+                        data-part="own-idle-invalid"
+                      >
+                        {t('power.automation.idle.invalid')}
+                      </p>
+                    {/if}
+                    {#if config.idle_off_min === 0}
+                      <p
+                        class="text-muted-foreground pt-1 text-xs"
+                        data-part="idle-never"
+                      >
+                        {t('power.automation.printers.idleNever')}
+                      </p>
+                    {/if}
+                  </TableCell>
                 {:else}
-                  <TableCell colspan={2}>
+                  <TableCell colspan={3}>
                     <span class="text-muted-foreground">
                       {t('power.plugs.none')}
                     </span>
@@ -337,4 +517,6 @@
       {/if}
     </div>
   </SettingsPane>
+
+  <EnergySettings />
 </div>

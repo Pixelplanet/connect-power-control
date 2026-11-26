@@ -20,6 +20,7 @@
   import { heldHost } from '../host';
   import { typed } from '../input';
   import { powerFor, type SettingsChanges } from '../power.svelte';
+  import { sameHaServer } from '../secret-target';
   import { PANE_BODY } from './pane-body';
 
   let { saved }: { saved: SettingsResponse } = $props();
@@ -47,8 +48,12 @@
   const dirty = $derived(
     token.trim() !== '' || url.trim() !== (saved.settings.ha_url ?? ''),
   );
-  const canTest = $derived(
-    url.trim() !== '' && (token.trim() !== '' || hasToken),
+  // A saved token is used only with the server it was saved for, so another
+  // server asks for it again.
+  const kept = $derived(hasToken && sameHaServer(saved.settings.ha_url, url));
+  const canTest = $derived(url.trim() !== '' && (token.trim() !== '' || kept));
+  const needsToken = $derived(
+    hasToken && !kept && url.trim() !== '' && token.trim() === '',
   );
 
   const test = async (): Promise<void> => {
@@ -131,8 +136,9 @@
             value: token,
             oninput: typed((value) => (token = value)),
             placeholder: hasToken
-              ? t('power.field.secretSaved')
+              ? t(kept ? 'power.field.secretSaved' : 'power.field.secretAgain')
               : t('power.connections.ha.tokenExample'),
+            required: needsToken,
             autocomplete: 'new-password',
           }}
         />
@@ -172,7 +178,11 @@
       >
         {t('power.connections.test')}
       </Button>
-      <Button type="submit" disabled={!dirty || testing} pending={saving}>
+      <Button
+        type="submit"
+        disabled={!dirty || testing || needsToken}
+        pending={saving}
+      >
         {t('power.connections.save')}
       </Button>
     {/snippet}

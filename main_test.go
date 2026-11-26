@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -411,7 +412,7 @@ func TestDirectHTTPTasmotaPollAndSwitch(t *testing.T) {
 				"Status":{"DeviceName":"Entertainment Center","FriendlyName":["Entertainment Center"],"Topic":"Entertainment_Center"},
 				"StatusFWR":{"Hardware":"ESP8266EX"},
 				"StatusSNS":{"ENERGY":{"Power":%.1f,"Voltage":231.0,"Current":0.25}},
-				"StatusSTS":{"POWER":"%s"}
+				"StatusSTS":{"POWER":"%s","Wifi":{"AP":1,"SSId":"HomeNet","RSSI":84,"Signal":-58}}
 			}`, watts, pwr)
 		case "POWER1 0":
 			relayOn = false
@@ -469,6 +470,9 @@ func TestDirectHTTPTasmotaPollAndSwitch(t *testing.T) {
 	if watts == nil || *watts != 42.3 {
 		t.Errorf("PowerWatts = %v, want 42.3", watts)
 	}
+	if signal := wifiOf(m, cfg.plugKey()); signal == nil || *signal != -58 {
+		t.Errorf("WifiDBm = %v, want -58", signal)
+	}
 
 	if err := m.switchDevicePower(ctx, cfg, false); err != nil {
 		t.Fatalf("switchDevicePower(OFF) failed: %v", err)
@@ -504,4 +508,197 @@ func TestDirectHTTPTasmotaPollAndSwitch(t *testing.T) {
 	if red.HTTPPassword != "" || !red.HasHTTPPassword {
 		t.Fatalf("redacted() unexpected: %+v", red)
 	}
+}
+
+// --- Wi-Fi signal and the plug's own protection ---
+
+func wifiOf(m *module, key string) *int {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if plug := m.plugs[key]; plug != nil && plug.WifiDBm != nil {
+		v := *plug.WifiDBm
+		return &v
+	}
+	return nil
+}
+
+func protectionOf(m *module, key string, relay int) string {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if plug := m.plugs[key]; plug != nil {
+		return plug.protectionOf(relay)
+	}
+	return ""
+}
+
+func TestTasmotaWifiSignalFromState(t *testing.T) {
+	m := newModule(nil)
+	now := time.Now()
+
+	m.handleMQTTPacket("tele/plug1/STATE", []byte(`{"POWER":"ON","Wifi":{"AP":1,"SSId":"HomeNet","BSSId":"AA:BB:CC:DD:EE:FF","Channel":6,"RSSI":74,"Signal":-63}}`), now)
+	if got := wifiOf(m, "plug1"); got == nil || *got != -63 {
+		t.Fatalf("signal from STATE = %v, want -63", got)
+	}
+
+	// An older build tells only a quality from 0 to 100.
+	m.handleMQTTPacket("tele/plug2/STATE", []byte(`{"POWER":"ON","Wifi":{"RSSI":60}}`), now)
+	if got := wifiOf(m, "plug2"); got == nil || *got != -70 {
+		t.Fatalf("signal from RSSI = %v, want -70", got)
+	}
+
+	// The answer to the STATE query, and the one to Status 11.
+	m.handleMQTTPacket("stat/plug3/RESULT", []byte(`{"POWER":"OFF","Wifi":{"Signal":-48}}`), now)
+	if got := wifiOf(m, "plug3"); got == nil || *got != -48 {
+		t.Fatalf("signal from RESULT = %v, want -48", got)
+	}
+	m.handleMQTTPacket("stat/plug4/STATUS11", []byte(`{"StatusSTS":{"POWER":"ON","Wifi":{"Signal":-81}}}`), now)
+	if got := wifiOf(m, "plug4"); got == nil || *got != -81 {
+		t.Fatalf("signal from STATUS11 = %v, want -81", got)
+	}
+
+	// A message with no Wifi object leaves the signal as it is.
+	m.handleMQTTPacket("stat/plug1/RESULT", []byte(`{"POWER":"OFF"}`), now)
+	if got := wifiOf(m, "plug1"); got == nil || *got != -63 {
+		t.Fatalf("a message with no signal changed it to %v", got)
+	}
+}
+
+func TestTasmotaMaxPowerWarningIsAProtectionFault(t *testing.T) {
+	now := time.Now()
+	for name, warning := range map[string]string{
+		"a number":  `{"Time":"2026-11-22T10:00:00","MaxPowerReached":2600}`,
+		"with unit": `{"MaxPowerReached":"2600W"}`,
+		"a new try": `{"MaxPowerReachedRetry":"OFF"}`,
+	} {
+		m := newModule(nil)
+		m.handleMQTTPacket("stat/plug1/RESULT", []byte(`{"POWER":"ON"}`), now)
+		m.handleMQTTPacket("stat/plug1/WARNING", []byte(warning), now)
+		if got := protectionOf(m, "plug1", 1); got != protectOverpower {
+			t.Fatalf("%s: protection = %q, want overpower", name, got)
+		}
+
+		// The relay going off does not end it. The relay coming on does.
+		m.handleMQTTPacket("stat/plug1/RESULT", []byte(`{"POWER":"OFF"}`), now)
+		if got := protectionOf(m, "plug1", 1); got != protectOverpower {
+			t.Fatalf("%s: the fault went away with the relay off", name)
+		}
+		m.handleMQTTPacket("stat/plug1/POWER", []byte("ON"), now)
+		if got := protectionOf(m, "plug1", 1); got != "" {
+			t.Fatalf("%s: the fault stayed with the relay on again: %q", name, got)
+		}
+	}
+
+	m := newModule(nil)
+	// A budget a person set is no fault, and neither is another warning.
+	m.handleMQTTPacket("stat/plug1/WARNING", []byte(`{"MaxEnergyReached":"3000Wh"}`), now)
+	m.handleMQTTPacket("stat/plug1/WARNING", []byte(`not json`), now)
+	if got := protectionOf(m, "plug1", 1); got != "" {
+		t.Fatalf("another warning is a fault: %q", got)
+	}
+
+	// The fault is the whole plug's, and it shows on the relay a printer has.
+	cfg := normalizeDeviceConfig(DeviceConfig{Driver: DriverTasmota, TasmotaTopic: "plug1", RelayIndex: 2})
+	m.handleMQTTPacket("stat/plug1/WARNING", []byte(`{"MaxPowerReached":3100}`), now)
+	m.mu.RLock()
+	shown := m.plugSnapshotLocked(cfg)
+	m.mu.RUnlock()
+	if shown.Protection != protectOverpower {
+		t.Fatalf("the answer for relay 2 says %q", shown.Protection)
+	}
+	m.handleMQTTPacket("stat/plug1/RESULT", []byte(`{"POWER2":"ON"}`), now)
+	if got := protectionOf(m, "plug1", 2); got != "" {
+		t.Fatalf("the fault stayed after relay 2 came on: %q", got)
+	}
+
+	// A plug with a topic layout of its own.
+	disc := `{"t":"bench","ft":"farm/%topic%/%prefix%/","tp":["cmnd","state","telem"],"rl":[1]}`
+	m.handleMQTTPacket("tasmota/discovery/AABBCCDDEEFF/config", []byte(disc), now)
+	m.handleMQTTPacket("farm/bench/state/WARNING", []byte(`{"MaxPowerReached":2600}`), now)
+	if got := protectionOf(m, "bench", 1); got != protectOverpower {
+		t.Fatalf("a warning on a custom topic: protection = %q", got)
+	}
+	m.handleMQTTPacket("farm/bench/state/RESULT", []byte(`{"POWER":"ON"}`), now)
+	if got := protectionOf(m, "bench", 1); got != "" {
+		t.Fatalf("the fault stayed on a custom topic: %q", got)
+	}
+}
+
+func TestAQueryAsksTasmotaForItsState(t *testing.T) {
+	m := newModule(nil)
+	now := time.Now()
+	has := func(list []string, want string) bool {
+		for _, got := range list {
+			if got == want {
+				return true
+			}
+		}
+		return false
+	}
+
+	// A plug nothing is known of yet.
+	m.mu.RLock()
+	empty, status := m.plugQueryLocked("plug1")
+	m.mu.RUnlock()
+	if !has(empty, "cmnd/plug1/STATE") || !has(empty, "cmnd/plug1/POWER1") || status != "cmnd/plug1/Status" {
+		t.Fatalf("an unknown plug is asked %v and %q", empty, status)
+	}
+
+	// A plug with two relays and a topic layout of its own.
+	disc := `{"t":"bench","ft":"farm/%topic%/%prefix%/","tp":["cmnd","state","telem"],"rl":[1,1]}`
+	m.handleMQTTPacket("tasmota/discovery/AABBCCDDEEFF/config", []byte(disc), now)
+	m.mu.RLock()
+	empty, status = m.plugQueryLocked("bench")
+	m.mu.RUnlock()
+	if len(empty) != 4 || !has(empty, "farm/bench/cmnd/PowerOnState") || !has(empty, "farm/bench/cmnd/STATE") || !has(empty, "farm/bench/cmnd/POWER2") || status != "farm/bench/cmnd/Status" {
+		t.Fatalf("a plug with its own layout is asked %v and %q", empty, status)
+	}
+
+	// The 5-second tick does not ask for the state: only the meter reading,
+	// and the relay while it is not known.
+	m.configs["p1"] = normalizeDeviceConfig(DeviceConfig{Driver: DriverTasmota, TasmotaTopic: "bench"})
+	recorder := &publishRecorder{}
+	m.mqttClient, m.mqttUp = recorder, true
+	m.pollAssignedPlugsEnergy()
+	for _, topic := range recorder.topics() {
+		if strings.HasSuffix(topic, "/STATE") {
+			t.Fatalf("the tick asked for the state: %v", recorder.topics())
+		}
+	}
+	if !has(recorder.topics(), "farm/bench/cmnd/Status") {
+		t.Fatalf("the tick did not ask for the reading: %v", recorder.topics())
+	}
+
+	recorder.reset()
+	m.queryPlugState("bench")
+	if !has(recorder.topics(), "farm/bench/cmnd/STATE") {
+		t.Fatalf("the query did not ask for the state: %v", recorder.topics())
+	}
+}
+
+// publishRecorder is an MQTT client that keeps the topics it was told to
+// publish on. Only Publish is used: every other call of the interface would
+// stop the test.
+type publishRecorder struct {
+	mqtt.Client
+	mu   sync.Mutex
+	sent []string
+}
+
+func (r *publishRecorder) Publish(topic string, _ byte, _ bool, _ interface{}) mqtt.Token {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sent = append(r.sent, topic)
+	return &mqtt.DummyToken{}
+}
+
+func (r *publishRecorder) topics() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.sent...)
+}
+
+func (r *publishRecorder) reset() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.sent = nil
 }

@@ -32,6 +32,7 @@
   import LinkButton from '../link-button.svelte';
   import { portsTabHref } from '../links';
   import { powerFor, type SettingsChanges } from '../power.svelte';
+  import { sameBroker } from '../secret-target';
   import { PANE_BODY } from './pane-body';
 
   let { saved }: { saved: SettingsResponse } = $props();
@@ -128,7 +129,20 @@
     builtin ? !missingCredentials : brokerHost.trim() !== '',
   );
 
+  // A saved password is used only with the broker it was saved for, so
+  // another broker asks for it again.
+  const retype = $derived(
+    saved.settings.has_password && !sameBroker(saved.settings, changes),
+  );
+
+  // Saving would drop the saved password, so a broker that signs in by user
+  // name waits until it is typed again. Clearing the user name saves without.
+  const needsPassword = $derived(
+    retype && password === '' && username.trim() !== '',
+  );
+
   const passwordHint = $derived.by((): string => {
+    if (retype) return t('power.field.secretAgain');
     if (saved.settings.has_password) return t('power.field.secretSaved');
     return builtin ? t('power.field.required') : t('power.field.optional');
   });
@@ -449,7 +463,7 @@
       </Button>
       <Button
         type="submit"
-        disabled={!dirty || testing || missingCredentials}
+        disabled={!dirty || testing || missingCredentials || needsPassword}
         pending={saving}
       >
         {t('power.connections.save')}

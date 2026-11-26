@@ -10,6 +10,7 @@ import {
   relayIndexOf,
   textOr,
 } from './api';
+import { samePlugHost } from './secret-target';
 
 /** What the plug is: its firmware, or the system that controls it. */
 export type PlugKind =
@@ -238,6 +239,8 @@ export interface PlugDraft {
   httpHost: string;
   httpPassword: string;
   hasHttpPassword: boolean;
+  /** The address the saved password belongs to. */
+  savedHttpHost: string;
   mqttCmdTopic: string;
   mqttStateTopic: string;
   mqttAvailTopic: string;
@@ -260,6 +263,7 @@ export const draftOf = (
   httpHost: textOr(cfg?.http_host, suggestedHost),
   httpPassword: '',
   hasHttpPassword: Boolean(cfg?.has_http_password),
+  savedHttpHost: cfg?.http_host ?? '',
   mqttCmdTopic: cfg?.mqtt_command_topic ?? '',
   mqttStateTopic: cfg?.mqtt_state_topic ?? '',
   mqttAvailTopic: cfg?.mqtt_availability_topic ?? '',
@@ -271,6 +275,13 @@ export const draftOf = (
   haEntityId: cfg?.ha_entity_id ?? '',
   haPowerEntityId: cfg?.ha_power_entity_id ?? '',
 });
+
+/**
+ * Whether a password left empty keeps the saved one. A saved password is
+ * used only with the plug it was saved for, so another address asks again.
+ */
+export const keepsPlugPassword = (draft: PlugDraft): boolean =>
+  draft.hasHttpPassword && samePlugHost(draft.httpHost, draft.savedHttpHost);
 
 /** The value that names the plug for the draft's driver. */
 export const addressOf = (draft: PlugDraft): string => {
@@ -307,6 +318,7 @@ export const configOf = (
     auto_off_after_print: existing?.auto_off_after_print ?? false,
     auto_off_default: existing?.auto_off_default,
     cooldown_sec: existing?.cooldown_sec,
+    idle_off_min: existing?.idle_off_min,
   };
 
   switch (DRIVER_FIELDS[draft.driver].address) {
@@ -315,7 +327,7 @@ export const configOf = (
       body.http_host = draft.httpHost.trim();
       body.http_password = draft.httpPassword;
       body.keep_http_password =
-        draft.httpPassword === '' && draft.hasHttpPassword;
+        draft.httpPassword === '' && keepsPlugPassword(draft);
       body.relay_index = relayOf(draft);
       break;
     case 'entity':
@@ -359,17 +371,19 @@ export const clearedConfig = (
   auto_off_after_print: existing?.auto_off_after_print ?? false,
   auto_off_default: existing?.auto_off_default,
   cooldown_sec: existing?.cooldown_sec,
+  idle_off_min: existing?.idle_off_min,
 });
 
 /**
- * The request that changes one printer's auto-off choices and nothing of its
- * plug. A saved password stays saved: the listing never carries it.
+ * The request that changes one printer's auto-off choices, or its idle time,
+ * and nothing of its plug. A saved password stays saved: the listing never carries it.
  */
 export const withAutoOff = (
   existing: DeviceConfig,
   changes: {
     auto_off_after_print?: boolean;
     cooldown_sec?: number | undefined;
+    idle_off_min?: number | undefined;
   },
 ): DeviceConfig => ({
   ...existing,
@@ -379,6 +393,8 @@ export const withAutoOff = (
     changes.auto_off_after_print ?? existing.auto_off_after_print,
   cooldown_sec:
     'cooldown_sec' in changes ? changes.cooldown_sec : existing.cooldown_sec,
+  idle_off_min:
+    'idle_off_min' in changes ? changes.idle_off_min : existing.idle_off_min,
 });
 
 /**

@@ -24,7 +24,9 @@ import (
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 	"github.com/prusa3d/prusa-connect/sdk/accessapi"
+	"github.com/prusa3d/prusa-connect/sdk/busapi"
 	"github.com/prusa3d/prusa-connect/sdk/deviceapi"
+	"github.com/prusa3d/prusa-connect/sdk/diagnosticsapi"
 	"github.com/prusa3d/prusa-connect/sdk/extension"
 	"github.com/prusa3d/prusa-connect/sdk/fault"
 	"github.com/prusa3d/prusa-connect/sdk/routesapi"
@@ -35,7 +37,7 @@ import (
 const (
 	name    = "connect-power-control"
 	logName = "connect-power-control"
-	release = extension.Version("0.5.0")
+	release = extension.Version("0.6.0")
 
 	defaultMQTTPort     = 1883
 	defaultMQTTTLSPort  = 8883
@@ -72,6 +74,9 @@ type Settings struct {
 	KeepHAToken        bool   `json:"keep_ha_token,omitempty"`
 	AutoOffCooldownSec int    `json:"auto_off_cooldown_sec"`
 	ConfirmTurnOff     *bool  `json:"confirm_turn_off"`
+	// IdleOffMin is after how many minutes a printer that is on and idle is
+	// turned off. 0, the default, never does that.
+	IdleOffMin int `json:"idle_off_min"`
 
 	// Legacy option from 0.1.0; parsed into MQTTHost/MQTTPort/MQTTTLS when present.
 	MQTTBroker string `json:"mqtt_broker,omitempty"`
@@ -135,7 +140,7 @@ func normalizeSettings(s Settings) Settings {
 	}
 	s.MQTTHost = strings.TrimSpace(s.MQTTHost)
 	s.MQTTBroker = ""
-	if s.MQTTPort <= 0 {
+	if s.MQTTPort <= 0 || s.MQTTPort > maxPort {
 		if s.MQTTTLS && !s.MQTTBuiltin {
 			s.MQTTPort = defaultMQTTTLSPort
 		} else {
@@ -147,17 +152,45 @@ func normalizeSettings(s Settings) Settings {
 	} else {
 		s.MQTTClientID = strings.TrimSpace(s.MQTTClientID)
 	}
-	if s.AutoOffCooldownSec < 0 {
-		s.AutoOffCooldownSec = 0
-	}
+	s.AutoOffCooldownSec = clampCooldownSec(s.AutoOffCooldownSec)
 	if s.ConfirmTurnOff == nil {
 		s.ConfirmTurnOff = boolPtr(true)
 	}
+	s.IdleOffMin = clampIdleOffMin(s.IdleOffMin)
 	s.HAURL = normalizeBaseURL(s.HAURL)
 	s.HAToken = strings.TrimSpace(s.HAToken)
 	s.HasPassword = s.MQTTPassword != ""
 	s.HasHAToken = s.HAToken != ""
 	return s
+}
+
+// The idle time a printer may be given, in minutes. A shorter one would turn
+// a printer off while somebody is still loading it.
+const (
+	minIdleOffMin = 10
+	maxIdleOffMin = 10080
+)
+
+// maxCooldownSec is the longest wait after a print: one day.
+const maxCooldownSec = 86400
+
+// clampCooldownSec brings a wait after a print into what is allowed.
+func clampCooldownSec(sec int) int {
+	return min(max(sec, 0), maxCooldownSec)
+}
+
+// clampIdleOffMin brings an idle time into what is allowed. 0 stays 0, which
+// is "never".
+func clampIdleOffMin(minutes int) int {
+	switch {
+	case minutes <= 0:
+		return 0
+	case minutes < minIdleOffMin:
+		return minIdleOffMin
+	case minutes > maxIdleOffMin:
+		return maxIdleOffMin
+	}
+	return minutes
 }
 
 func parseBrokerURL(raw string) (host string, port int, useTLS bool) {
@@ -176,12 +209,25 @@ func parseBrokerURL(raw string) (host string, port int, useTLS bool) {
 		b = b[at+1:]
 	}
 	if h, p, err := net.SplitHostPort(b); err == nil {
-		if n, err := strconv.Atoi(p); err == nil && n > 0 {
+		if n, err := strconv.Atoi(p); err == nil && n > 0 && n <= maxPort {
 			port = n
 		}
 		return h, port, useTLS
 	}
 	return strings.Trim(b, "[]"), 0, useTLS
+}
+
+// maxPort is the highest TCP port.
+const maxPort = 65535
+
+// portAllowed answers whether the port written in an address, if any, is a
+// TCP port. An empty port means the scheme's default.
+func portAllowed(p string) bool {
+	if p == "" {
+		return true
+	}
+	n, err := strconv.Atoi(p)
+	return err == nil && n > 0 && n <= maxPort
 }
 
 func (s Settings) mqttConfigured() bool {
@@ -287,6 +333,9 @@ type DeviceConfig struct {
 	AutoOffAfterPrint bool `json:"auto_off_after_print"`
 	AutoOffDefault    bool `json:"auto_off_default,omitempty"`
 	CooldownSec       *int `json:"cooldown_sec,omitempty"`
+	// IdleOffMin is this printer's own idle time in minutes. Left out, the
+	// setting for all printers counts; 0 never turns this printer off.
+	IdleOffMin *int `json:"idle_off_min,omitempty"`
 }
 
 func (c DeviceConfig) relayIndex() int {
@@ -396,7 +445,7 @@ func normalizeHTTPHost(raw string) string {
 		s = "http://" + s
 	}
 	u, err := url.Parse(s)
-	if err != nil || strings.TrimSpace(u.Host) == "" {
+	if err != nil || strings.TrimSpace(u.Host) == "" || !portAllowed(u.Port()) {
 		return ""
 	}
 	scheme := strings.ToLower(u.Scheme)
@@ -426,6 +475,16 @@ type PlugTelemetry struct {
 	CurrentAmps  *float64       `json:"current_amps"` // from tele/<topic>/SENSOR ENERGY.Current
 	LastError    string         `json:"last_error,omitempty"`
 	UpdatedAt    *time.Time     `json:"updated_at,omitempty"`
+	// WifiDBm is the plug's Wi-Fi signal in dBm, where the plug tells it.
+	WifiDBm *int `json:"wifi_dbm,omitempty"`
+	// Protection says the plug turned itself off to protect itself, and why:
+	// overpower, overtemp, overvoltage or undervoltage. It is filled for the
+	// relay a printer's config names (plugSnapshotLocked).
+	Protection string `json:"protection,omitempty"`
+	// AfterPowerCut is what the plug's relay does when the power comes back:
+	// off, on, last, toggle, always_on, delayed_on or switch. It is the plug's
+	// own setting, read and never changed, and filled like Protection.
+	AfterPowerCut string `json:"after_power_cut,omitempty"`
 
 	MAC         string    `json:"-"`
 	FullTopic   string    `json:"-"`
@@ -433,6 +492,78 @@ type PlugTelemetry struct {
 	StateTexts  [4]string `json:"-"`
 	OnlineText  string    `json:"-"`
 	OfflineText string    `json:"-"`
+
+	// meterAt is when PowerWatts was last reported. It is not exported, so it
+	// stays out of every answer, and clone copies it with the struct.
+	meterAt time.Time
+	// protections is what tripped, by relay number. Key 0 is the whole plug.
+	protections map[int]string
+	// wifiAt is when a plug read by address was last asked for its signal
+	// and for what it does after a power cut.
+	wifiAt time.Time
+	// afterCut is what a relay does after a power cut, by relay number. Key 0
+	// is the whole plug.
+	afterCut map[int]string
+}
+
+// Why a plug turned itself off.
+const (
+	protectOverpower    = "overpower"
+	protectOvertemp     = "overtemp"
+	protectOvervoltage  = "overvoltage"
+	protectUndervoltage = "undervoltage"
+)
+
+// setProtection keeps why relay turned itself off, 0 for the whole plug. An
+// empty kind says it is over.
+func (p *PlugTelemetry) setProtection(relay int, kind string) {
+	if kind == "" {
+		delete(p.protections, relay)
+		return
+	}
+	if p.protections == nil {
+		p.protections = make(map[int]string)
+	}
+	p.protections[relay] = kind
+}
+
+// protectionOf is what tripped for relay: its own fault, else the plug's.
+func (p *PlugTelemetry) protectionOf(relay int) string {
+	if kind := p.protections[relay]; kind != "" {
+		return kind
+	}
+	return p.protections[0]
+}
+
+// setWifi takes a signal in dBm. A value no radio reports is not taken.
+func (p *PlugTelemetry) setWifi(dbm float64) {
+	if math.IsNaN(dbm) || dbm < -120 || dbm > 0 {
+		return
+	}
+	v := int(math.Round(dbm))
+	p.WifiDBm = &v
+}
+
+// wifiReading is what a Tasmota plug says of its Wi-Fi: Signal in dBm, and
+// on older builds only RSSI, a quality from 0 to 100. The network's name is
+// not read.
+type wifiReading struct {
+	Signal *float64 `json:"Signal"`
+	RSSI   *float64 `json:"RSSI"`
+}
+
+// setTasmotaWifi takes the Wifi object of a Tasmota state message.
+func (p *PlugTelemetry) setTasmotaWifi(raw json.RawMessage) {
+	var wifi wifiReading
+	if len(raw) == 0 || json.Unmarshal(raw, &wifi) != nil {
+		return
+	}
+	switch {
+	case wifi.Signal != nil:
+		p.setWifi(*wifi.Signal)
+	case wifi.RSSI != nil && *wifi.RSSI >= 0 && *wifi.RSSI <= 100:
+		p.setWifi(*wifi.RSSI/2 - 100)
+	}
 }
 
 func normalizeRelayIndex(idx int) int {
@@ -475,6 +606,24 @@ func (p *PlugTelemetry) clone() PlugTelemetry {
 	if p.UpdatedAt != nil {
 		v := *p.UpdatedAt
 		cp.UpdatedAt = &v
+	}
+	if p.WifiDBm != nil {
+		v := *p.WifiDBm
+		cp.WifiDBm = &v
+	}
+	cp.afterCut = nil
+	if len(p.afterCut) > 0 {
+		cp.afterCut = make(map[int]string, len(p.afterCut))
+		for k, v := range p.afterCut {
+			cp.afterCut[k] = v
+		}
+	}
+	cp.protections = nil
+	if len(p.protections) > 0 {
+		cp.protections = make(map[int]string, len(p.protections))
+		for k, v := range p.protections {
+			cp.protections[k] = v
+		}
 	}
 	return cp
 }
@@ -609,6 +758,10 @@ type autoOffTracker struct {
 	// offFault is why the plug could not be turned off when the wait was
 	// over. The turn-off is tried again until it works.
 	offFault string
+	// restored says the tracker was read from autooff.json and the printer
+	// was not seen since. The first look at the printer drops a print it has
+	// left behind.
+	restored bool
 }
 
 // skippedPrint follows the one print a person switched auto-off away for, on
@@ -656,6 +809,15 @@ type PrintPowerRecord struct {
 	EnergyWh    float64    `json:"energy_wh"`
 	AvgWatts    float64    `json:"avg_watts"`
 	PeakWatts   float64    `json:"peak_watts"`
+	// MeteredSec is how long the plug was on with a reading during the print.
+	// EndEstimated says the print ended while nothing was sampled, so its end
+	// is the last sample before that time.
+	MeteredSec   float64 `json:"metered_sec,omitempty"`
+	EndEstimated bool    `json:"end_estimated,omitempty"`
+	// AwaySince is when the printer went away during the print. It is set
+	// only on a running print, and gone once the printer is back on it or the
+	// print is closed.
+	AwaySince *time.Time `json:"away_since,omitempty"`
 }
 
 // DeviceUsage holds persisted and live power usage metrics for one printer.
@@ -704,22 +866,87 @@ type module struct {
 	usage          map[string]*DeviceUsage
 	lastUsageSaved time.Time
 	waiters        []*stateWaiter
+	// autoOffSaved is autooff.json as it was last written or read.
+	autoOffSaved []byte
+	// autoOffSaveMu makes one save of autooff.json follow another, so the
+	// state taken last is the one written last.
+	autoOffSaveMu sync.Mutex
+	// configsSaveMu and usageSaveMu do the same for configs.json and
+	// usage.json. Each is taken before mu, never while mu is held.
+	configsSaveMu sync.Mutex
+	usageSaveMu   sync.Mutex
+	// idle is since when each printer is on with nothing to do, for the
+	// printers an idle time counts for.
+	idle map[string]*idleClock
+	// lost follows a plug that went away during a print (events.go).
+	lost map[string]*lostWatch
+
+	// events tells the host's event stream. It is nil where there is no
+	// session, as in tests. eventsOff says the host does not serve the call,
+	// eventOff names the endpoints the operator did not approve, and
+	// eventLogged the ones a dropped event was logged for (events.go).
+	events      eventEmitter
+	eventsOff   atomic.Bool
+	eventOff    sync.Map
+	eventLogged sync.Map
+
+	// conn is the session with the host. It is nil in tests. hostJobs is the
+	// newest print of each printer as the host's event stream told it, and
+	// jobCursor where that stream is read on from (jobfeed.go). Both are
+	// under mu.
+	conn      *wirerpc.Conn
+	hostJobs  map[string]hostJob
+	jobCursor string
+	// jobRetry is the wait before the stream is asked for again. It is zero
+	// outside tests, which shorten it.
+	jobRetry time.Duration
+
+	// energy is the energy record kept in files (energy.go), and energyHeld
+	// its settings.
+	energy     energyStore
+	energyHeld atomic.Pointer[EnergySettings]
+	// prices keeps the price of sessions and prints the printer page was
+	// answered with (energy_cost.go).
+	prices priceMemo
+	// now is the clock. It is nil outside tests, which read time.Now.
+	now func() time.Time
+}
+
+// clock is the time the recorder and the energy routes go by.
+func (m *module) clock() time.Time {
+	if m.now != nil {
+		return m.now()
+	}
+	return time.Now()
 }
 
 func newModule(conn *wirerpc.Conn) *module {
 	m := &module{
 		devices:    deviceapi.NewClient(conn),
 		access:     accessapi.NewClient(conn),
-		httpClient: &http.Client{Timeout: 5 * time.Second},
+		httpClient: newHTTPClient(5 * time.Second),
 		plugs:      make(map[string]*PlugTelemetry),
 		configs:    make(map[string]DeviceConfig),
 		trackers:   make(map[string]*autoOffTracker),
 		skips:      make(map[string]*skippedPrint),
 		axes:       make(map[string]*axisSample),
 		usage:      make(map[string]*DeviceUsage),
+		conn:       conn,
+		hostJobs:   make(map[string]hostJob),
+		idle:       make(map[string]*idleClock),
+		lost:       make(map[string]*lostWatch),
+	}
+	// A nil session inside the interface would not be nil.
+	if conn != nil {
+		m.events = busapi.NewClient(conn)
 	}
 	def := defaultSettings()
 	m.held.Store(&def)
+	m.energy.pending = make(map[string]map[string]*[slotsPerDay]slotAcc)
+	m.energy.days = make(map[string]*cachedDay)
+	energyDef := defaultEnergySettings()
+	m.energyHeld.Store(&energyDef)
+	m.prices.held = make(map[priceMemoKey]priceMemoEntry)
 	return m
 }
 
@@ -759,7 +986,23 @@ func (m *module) startSettings(sent hostSettings) Settings {
 		_ = m.writeSettingsToDisk(effective)
 	}
 
-	return m.applyHostPins(effective)
+	return withoutMovedSecrets(normalizeSettings(effective), m.applyHostPins(effective))
+}
+
+// withoutMovedSecrets is next without a saved password or token whose address
+// a pin in the host's settings changed. A secret is used only with the
+// address it was saved for. Only the running settings lose it, so removing
+// the pin brings it back.
+func withoutMovedSecrets(saved, next Settings) Settings {
+	if next.MQTTPassword != "" && !sameBroker(saved, next) {
+		next.MQTTPassword = ""
+		next.HasPassword = false
+	}
+	if next.HAToken != "" && haOrigin(saved.HAURL) != haOrigin(next.HAURL) {
+		next.HAToken = ""
+		next.HasHAToken = false
+	}
+	return next
 }
 
 // applyHostPins writes the values the operator pinned in the host's settings
@@ -790,6 +1033,16 @@ func main() {
 	}
 }
 
+// moduleInfo is what the extension says of itself on plugin.info.
+func moduleInfo() wirerpc.Info {
+	return wirerpc.Info{
+		Name:     name,
+		Version:  release,
+		Contract: wirerpc.Contract,
+		Serves:   []wirerpc.Method{wirerpc.MethodConfigure, diagnosticsapi.MethodCollect},
+	}
+}
+
 func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
 	defer stop()
@@ -812,19 +1065,15 @@ func run() error {
 		Role: wirerpc.RoleChild,
 		Methods: wirerpc.Methods{
 			wirerpc.MethodInfo: func(context.Context, wirerpc.Call) (any, error) {
-				return routesapi.Describe(wirerpc.Info{
-					Name:     name,
-					Version:  release,
-					Contract: wirerpc.Contract,
-					Serves:   []wirerpc.Method{wirerpc.MethodConfigure},
-				}, openAPI)
+				return routesapi.Describe(moduleInfo(), openAPI)
 			},
+			// A file for the diagnostics bundle an administrator downloads. A
+			// host that does not know the call never makes it.
+			diagnosticsapi.MethodCollect: diagnosticsapi.Serve(func(_ context.Context, cursor string) (diagnosticsapi.Page, error) {
+				return mod.collectDiagnostics(cursor), nil
+			}),
 			wirerpc.MethodConfigure: wirerpc.ConfigureGranted(func(_ context.Context, sent hostSettings, grants wirerpc.Grants) error {
-				if grants.Data != "" {
-					mod.setDataDir(grants.Data)
-					mod.loadAllConfigs()
-					mod.loadAllUsage()
-				}
+				mod.configureData(grants.Data)
 				mod.setHostConfig(sent, grants)
 
 				effective := mod.startSettings(sent)
@@ -834,6 +1083,7 @@ func run() error {
 				return nil
 			}),
 			wirerpc.MethodShutdown: func(context.Context, wirerpc.Call) (any, error) {
+				mod.saveOnExit()
 				mod.disconnectMQTT()
 				return nil, nil
 			},
@@ -858,21 +1108,101 @@ func run() error {
 		mod.autoOffLoop(ctx)
 	}()
 
+	// Print start, end and outcome as the host tells them. A host that does
+	// not serve the stream ends this at once, and the poll is what remains.
+	go func() {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(500 * time.Millisecond):
+		}
+		mod.followJobs(ctx, func(ctx context.Context, params busapi.SubscribeParams, onWindow func(busapi.Window) error) error {
+			return busapi.Subscribe(ctx, conn, params, onWindow)
+		})
+	}()
+
 	fmt.Fprintf(os.Stderr, "%s %s serving on stdio (pid %d)\n", logName, release, os.Getpid())
 	if err := conn.Serve(ctx); err != nil {
+		mod.saveOnExit()
 		mod.disconnectMQTT()
 		return fmt.Errorf("serve: %w", err)
 	}
+	mod.saveOnExit()
 	mod.disconnectMQTT()
 	return nil
 }
 
 // --- Persistence (in grants.Data) ---
 
-func (m *module) setDataDir(dir string) {
+// setDataDir keeps the granted data directory and says whether it changed.
+func (m *module) setDataDir(dir string) bool {
 	m.mu.Lock()
+	defer m.mu.Unlock()
+	changed := m.dataDir != dir
 	m.dataDir = dir
-	m.mu.Unlock()
+	return changed
+}
+
+// configureData takes the data directory plugin.configure granted. The plug
+// assignments are read every time. Usage and energy are read only when the
+// directory changed, so a second plugin.configure keeps what memory holds and
+// has not been saved yet.
+func (m *module) configureData(dir string) {
+	if dir == "" {
+		return
+	}
+	m.mu.RLock()
+	fresh := m.dataDir != dir
+	m.mu.RUnlock()
+	if fresh {
+		// Before the directory is taken into use, so no write of this process
+		// is under way in it.
+		removeStaleTemps(dir)
+	}
+	changed := m.setDataDir(dir)
+	m.loadAllConfigs()
+	if changed {
+		m.loadAllUsage()
+		m.loadAutoOff()
+		m.loadEnergy()
+	}
+}
+
+// removeStaleTemps deletes what a write that was cut off left in the data
+// directory. writeFileAtomic writes beside its target under a name of its
+// own, and a process that is stopped before the rename leaves that file
+// behind. Those of settings.json and configs.json hold the saved secrets.
+// Only the temporary names of the five files kept in this directory are
+// touched, also the fixed name earlier versions wrote to.
+func removeStaleTemps(dir string) {
+	entries, _ := os.ReadDir(dir)
+	for _, entry := range entries {
+		name := entry.Name()
+		if !entry.Type().IsRegular() || !strings.HasSuffix(name, ".tmp") {
+			continue
+		}
+		for _, target := range []string{settingsFileName, configsFileName, usageFileName, energySettingsFile, autoOffFileName} {
+			if strings.HasPrefix(name, target+".") {
+				if err := os.Remove(filepath.Join(dir, name)); err != nil {
+					fmt.Fprintf(os.Stderr, "%s: delete %s: %v\n", logName, name, err)
+				}
+				break
+			}
+		}
+	}
+}
+
+// saveOnExit writes what memory still holds when the extension stops. The
+// energy record goes first, like on every tick, so a print is in its own file
+// before usage.json stops naming it as running.
+func (m *module) saveOnExit() {
+	if err := m.saveEnergy(); err != nil {
+		fmt.Fprintf(os.Stderr, "%s: save energy: %v\n", logName, err)
+	}
+	if err := m.saveAllUsage(); err != nil {
+		fmt.Fprintf(os.Stderr, "%s: save usage: %v\n", logName, err)
+	}
+	m.saveAutoOffIfChanged()
 }
 
 func (m *module) loadSettingsFromDisk() (Settings, bool) {
@@ -922,11 +1252,30 @@ func writeJSONAtomic(target string, v any) error {
 	if err != nil {
 		return err
 	}
-	tmp := target + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
+	return writeFileAtomic(target, raw)
+}
+
+// writeFileAtomic writes raw beside target under a name of its own, syncs it,
+// and renames it over target, so two writers never share a temporary file.
+func writeFileAtomic(target string, raw []byte) error {
+	f, err := os.CreateTemp(filepath.Dir(target), filepath.Base(target)+".*.tmp")
+	if err != nil {
 		return err
 	}
-	return os.Rename(tmp, target)
+	tmp := f.Name()
+	if _, err = f.Write(raw); err == nil {
+		err = f.Sync()
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil {
+		err = os.Rename(tmp, target)
+	}
+	if err != nil {
+		_ = os.Remove(tmp)
+	}
+	return err
 }
 
 func (m *module) loadAllConfigs() {
@@ -1014,6 +1363,10 @@ func cloneDeviceUsage(u *DeviceUsage) *DeviceUsage {
 			t := *u.CurrentPrint.EndedAt
 			p.EndedAt = &t
 		}
+		if u.CurrentPrint.AwaySince != nil {
+			t := *u.CurrentPrint.AwaySince
+			p.AwaySince = &t
+		}
 		cp.CurrentPrint = &p
 	}
 	if len(u.PrintHistory) > 0 {
@@ -1067,6 +1420,8 @@ func (m *module) loadAllUsage() {
 }
 
 func (m *module) saveAllUsage() error {
+	m.usageSaveMu.Lock()
+	defer m.usageSaveMu.Unlock()
 	m.mu.Lock()
 	dir := m.dataDir
 	if dir == "" {
@@ -1226,6 +1581,14 @@ func normalizeDeviceConfig(cfg DeviceConfig) DeviceConfig {
 
 	cfg.HasHTTPPassword = cfg.HTTPPassword != ""
 	cfg.KeepHTTPPassword = false
+	if cfg.CooldownSec != nil {
+		wait := clampCooldownSec(*cfg.CooldownSec)
+		cfg.CooldownSec = &wait
+	}
+	if cfg.IdleOffMin != nil {
+		own := clampIdleOffMin(*cfg.IdleOffMin)
+		cfg.IdleOffMin = &own
+	}
 	if !cfg.configured() {
 		cfg.RelayIndex = 0
 	} else if cfg.Driver == DriverHomeAssistant || cfg.Driver == DriverGenericMQTT {
@@ -1240,17 +1603,35 @@ func (m *module) saveConfig(_ context.Context, deviceID string, cfg DeviceConfig
 	keepHTTPPw := cfg.KeepHTTPPassword
 	cfg = normalizeDeviceConfig(cfg)
 
+	m.configsSaveMu.Lock()
+	defer m.configsSaveMu.Unlock()
 	m.mu.Lock()
-	if existing, ok := m.configs[deviceID]; ok && cfg.usesHTTP() && cfg.HTTPHost != "" && cfg.HTTPPassword == "" && keepHTTPPw {
+	if existing, ok := m.configs[deviceID]; ok && cfg.usesHTTP() && cfg.HTTPHost != "" && cfg.HTTPPassword == "" && keepHTTPPw && existing.HTTPPassword != "" {
+		// A saved password is kept only for the plug it was saved for.
+		if !strings.EqualFold(existing.HTTPHost, cfg.HTTPHost) {
+			m.mu.Unlock()
+			return errPlugPasswordRetype
+		}
 		cfg.HTTPPassword = existing.HTTPPassword
 		cfg.HasHTTPPassword = cfg.HTTPPassword != ""
 	}
+	return m.storeConfigLocked(deviceID, cfg)
+}
+
+// storeConfigLocked puts cfg in place for deviceID, drops what no longer
+// fits it and writes configs.json. The caller holds configsSaveMu and mu;
+// mu is released here.
+func (m *module) storeConfigLocked(deviceID string, cfg DeviceConfig) error {
 	m.configs[deviceID] = cfg
 	if !cfg.AutoOffAfterPrint {
 		delete(m.trackers, deviceID)
 	}
 	if cfg.AutoOffAfterPrint || !cfg.AutoOffDefault {
 		delete(m.skips, deviceID)
+	}
+	if !cfg.configured() {
+		delete(m.idle, deviceID)
+		delete(m.lost, deviceID)
 	}
 	dir := m.dataDir
 	snapshot := make(map[string]DeviceConfig, len(m.configs))
@@ -1329,6 +1710,11 @@ func (m *module) probeBuiltinBrokerReachability(brk *EmbeddedBroker, rawHost str
 	}
 	host, _, _ := parseBrokerURL(strings.TrimSpace(rawHost))
 	if host == "" || host == "127.0.0.1" || host == "::1" || strings.EqualFold(host, "localhost") {
+		return ""
+	}
+	// module.yaml declares the MQTT ports for this address. A broker granted
+	// another port is not checked.
+	if p := brk.Port(); p != defaultMQTTPort && p != defaultMQTTTLSPort {
 		return ""
 	}
 	before := brk.AcceptedCount()
@@ -1497,11 +1883,10 @@ func (m *module) testBroker(override *Settings) (bool, string, string, string) {
 	saved := m.settings()
 	candidate := saved
 	if override != nil {
-		candidate = *override
-		if candidate.MQTTPassword == "" && candidate.KeepPassword {
-			candidate.MQTTPassword = saved.MQTTPassword
+		candidate = m.applyHostPins(*override)
+		if err := keepPassword(*override, saved, &candidate); err != nil {
+			return false, candidate.brokerURL(), err.Error(), ""
 		}
-		candidate = m.applyHostPins(candidate)
 	}
 
 	if candidate.MQTTBuiltin {
@@ -1887,6 +2272,20 @@ func (m *module) handleMQTTPacket(msgTopic string, payloadBytes []byte, now time
 			}
 		}
 
+	case kind == "stat" && strings.EqualFold(leaf, "WARNING"):
+		// MaxPower: the plug measured more than its limit and turned its
+		// relays off. It says so once, and again each time it tries anew.
+		var warning map[string]json.RawMessage
+		if json.Unmarshal(payloadBytes, &warning) != nil {
+			return nil, ""
+		}
+		_, reached := warning["MaxPowerReached"]
+		_, retry := warning["MaxPowerReachedRetry"]
+		if reached || retry {
+			plug.setProtection(0, protectOverpower)
+			plug.UpdatedAt = &now
+		}
+
 	case strings.EqualFold(leaf, "RESULT") || leaf == "STATE" || strings.EqualFold(leaf, "STATUS11") || parsePowerLeafIndex(leaf) >= 0:
 		if strings.HasPrefix(payload, "{") {
 			var rawMap map[string]json.RawMessage
@@ -1898,6 +2297,10 @@ func (m *module) handleMQTTPacket(msgTopic string, payloadBytes []byte, now time
 				if json.Unmarshal(stsRaw, &stsMap) == nil {
 					rawMap = stsMap
 				}
+			}
+			plug.setTasmotaWifi(rawMap["Wifi"])
+			if raw, has := rawMap["PowerOnState"]; has {
+				plug.setAfterPowerCut(0, tasmotaAfterPowerCut(raw))
 			}
 			if cmdRaw, hasCmd := rawMap["Command"]; hasCmd {
 				var cmdStr string
@@ -1935,6 +2338,10 @@ func (m *module) handleMQTTPacket(msgTopic string, payloadBytes []byte, now time
 					plug.setRelayState(relayIdx, norm)
 					plug.LastError = ""
 					plug.UpdatedAt = &now
+					// A relay that is on again says the protection is over.
+					if norm == "ON" {
+						plug.setProtection(0, "")
+					}
 					m.notifyWaitersLocked(plug.Topic, relayIdx, stateEvent{State: norm})
 				}
 			}
@@ -1948,6 +2355,9 @@ func (m *module) handleMQTTPacket(msgTopic string, payloadBytes []byte, now time
 				plug.setRelayState(relayIdx, norm)
 				plug.LastError = ""
 				plug.UpdatedAt = &now
+				if norm == "ON" {
+					plug.setProtection(0, "")
+				}
 				m.notifyWaitersLocked(plug.Topic, relayIdx, stateEvent{State: norm})
 			}
 		}
@@ -1967,22 +2377,21 @@ func applyEnergyReading(plug *PlugTelemetry, energy *energyPayload, now time.Tim
 		return
 	}
 	plug.PowerWatts = energy.Power
+	if energy.Power != nil {
+		plug.meterAt = now
+	}
 	plug.Voltage = energy.Voltage
 	plug.CurrentAmps = energy.Current
 	plug.UpdatedAt = &now
 }
 
-func (m *module) queryPlugState(topic string) {
-	if topic == "" {
-		return
-	}
-	m.mu.RLock()
-	c := m.mqttClient
-	up := m.mqttUp
-	if c == nil || !up {
-		m.mu.RUnlock()
-		return
-	}
+// plugQueryLocked is what a Tasmota plug is asked when it is to say how it
+// is: the state of each relay and its own state, which carries the Wi-Fi
+// signal, and what it does after a power cut (PowerOnState, which an empty
+// payload reads and does not change), each with an empty payload, and the
+// topic of the meter reading.
+// The caller holds m.mu.
+func (m *module) plugQueryLocked(topic string) (cmdTopics []string, statusTopic string) {
 	plug := m.plugs[topic]
 	maxRelay := 1
 	if plug != nil && plug.RelayCount > maxRelay {
@@ -1996,7 +2405,7 @@ func (m *module) queryPlugState(topic string) {
 	if maxRelay > 8 {
 		maxRelay = 8
 	}
-	cmdTopics := make([]string, 0, maxRelay+1)
+	cmdTopics = make([]string, 0, maxRelay+1)
 	for r := 1; r <= maxRelay; r++ {
 		leaf := fmt.Sprintf("POWER%d", r)
 		if plug != nil {
@@ -2005,10 +2414,32 @@ func (m *module) queryPlugState(topic string) {
 			cmdTopics = append(cmdTopics, "cmnd/"+topic+"/"+leaf)
 		}
 	}
-	statusTopic := "cmnd/" + topic + "/Status"
+	statusTopic = "cmnd/" + topic + "/Status"
+	stateTopic := "cmnd/" + topic + "/STATE"
+	afterCutTopic := "cmnd/" + topic + "/PowerOnState"
 	if plug != nil {
 		statusTopic = plug.formatTopic(0, "Status")
+		stateTopic = plug.formatTopic(0, "STATE")
+		afterCutTopic = plug.formatTopic(0, "PowerOnState")
 	}
+	return append(cmdTopics, stateTopic, afterCutTopic), statusTopic
+}
+
+// queryPlugState asks a Tasmota plug how it is. It runs when the broker
+// connects, when a plug is found or comes back, and after a switch or a
+// change of its set-up, not on every tick.
+func (m *module) queryPlugState(topic string) {
+	if topic == "" {
+		return
+	}
+	m.mu.RLock()
+	c := m.mqttClient
+	up := m.mqttUp
+	if c == nil || !up {
+		m.mu.RUnlock()
+		return
+	}
+	cmdTopics, statusTopic := m.plugQueryLocked(topic)
 	m.mu.RUnlock()
 
 	for _, ct := range cmdTopics {
@@ -2234,17 +2665,32 @@ func (m *module) getHTTPClient() *http.Client {
 	if m.httpClient != nil {
 		return m.httpClient
 	}
-	return &http.Client{Timeout: 5 * time.Second}
+	return newHTTPClient(5 * time.Second)
 }
+
+// newHTTPClient returns the client for plugs and Home Assistant. It follows no
+// redirect: a redirect may name a host that no egress entry declares, so the
+// 3xx answer is handed back and the caller treats it as an error.
+func newHTTPClient(timeout time.Duration) *http.Client {
+	return &http.Client{
+		Timeout: timeout,
+		CheckRedirect: func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+}
+
+// redirectError is the error for a 3xx answer, which is never followed.
+func redirectError(who string, status int) error {
+	return fmt.Errorf("%s answered with a redirect (HTTP %d); enter the final address instead", who, status)
+}
+
+func isRedirect(status int) bool { return status >= 300 && status < 400 }
 
 func (m *module) tasmotaHTTPGet(ctx context.Context, cfg DeviceConfig, cmnd string) ([]byte, error) {
 	base := cfg.httpBaseURL()
 	if base == "" {
 		return nil, errors.New("HTTP plug host or IP is required")
-	}
-	u, err := url.Parse(base + "/cm")
-	if err != nil {
-		return nil, err
 	}
 	q := url.Values{}
 	if cfg.HTTPPassword != "" {
@@ -2256,7 +2702,6 @@ func (m *module) tasmotaHTTPGet(ctx context.Context, cfg DeviceConfig, cmnd stri
 		q.Set("password", cfg.HTTPPassword)
 	}
 	q.Set("cmnd", cmnd)
-	u.RawQuery = q.Encode()
 
 	reqCtx := ctx
 	var cancel context.CancelFunc
@@ -2265,15 +2710,22 @@ func (m *module) tasmotaHTTPGet(ctx context.Context, cfg DeviceConfig, cmnd stri
 		defer cancel()
 	}
 
-	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, u.String(), nil)
+	// The query carries the plug's password. It is set after the request is
+	// built, and an error of the request is told without its address, so the
+	// password is in no error text.
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodGet, base+"/cm", nil)
 	if err != nil {
-		return nil, err
+		return nil, withoutURL(err)
 	}
+	req.URL.RawQuery = q.Encode()
 	resp, err := m.getHTTPClient().Do(req)
 	if err != nil {
-		return nil, err
+		return nil, withoutURL(err)
 	}
 	defer resp.Body.Close()
+	if isRedirect(resp.StatusCode) {
+		return nil, redirectError("plug", resp.StatusCode)
+	}
 
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 256<<10))
 	if err != nil {
@@ -2318,8 +2770,9 @@ func (m *module) pollHTTPPlug(ctx context.Context, cfg DeviceConfig) error {
 
 	var parsed struct {
 		Status struct {
-			DeviceName   string   `json:"DeviceName"`
-			FriendlyName []string `json:"FriendlyName"`
+			DeviceName   string          `json:"DeviceName"`
+			FriendlyName []string        `json:"FriendlyName"`
+			PowerOnState json.RawMessage `json:"PowerOnState"`
 		} `json:"Status"`
 		StatusFWR struct {
 			Hardware string `json:"Hardware"`
@@ -2389,6 +2842,8 @@ func (m *module) pollHTTPPlug(ctx context.Context, cfg DeviceConfig) error {
 	if parsed.StatusSNS.ENERGY != nil {
 		applyEnergyReading(plug, parsed.StatusSNS.ENERGY, now)
 	}
+	plug.setTasmotaWifi(parsed.StatusSTS["Wifi"])
+	plug.setAfterPowerCut(0, tasmotaAfterPowerCut(parsed.Status.PowerOnState))
 	m.mu.Unlock()
 	return nil
 }
@@ -2492,6 +2947,33 @@ type printerSafety struct {
 	JobFile        string
 	LastJobID      string
 	LastJobOutcome string
+	// JobStarted is when the server first saw the running print, and
+	// LastJobEnded when it saw the print before stop. Both are from the
+	// server's own job record, and empty where it has none.
+	JobStarted   time.Time
+	LastJobEnded *time.Time
+	// JobOver says the printer's state still names the print the server has
+	// just closed. The print record ends with the server's record, and no
+	// second record is begun for the moment the state lags behind.
+	JobOver bool
+}
+
+// closedJobLag is how long a printer's state may go on naming a print the
+// server has closed. After that the printer is taken at its word again.
+const closedJobLag = 2 * time.Minute
+
+// closedJobStillNamed reports whether the print the printer's state names,
+// by the number the printer gave it, is the one the server closed a moment
+// ago, with no print open.
+func closedJobStillNamed(jobs deviceapi.Jobs, stateJobID string, now time.Time) bool {
+	if jobs.Current != nil || jobs.Last == nil || jobs.Last.Ended == nil || stateJobID == "" {
+		return false
+	}
+	if strings.TrimSpace(jobs.Last.DeviceJobID) != stateJobID {
+		return false
+	}
+	since := now.Sub(*jobs.Last.Ended)
+	return since >= 0 && since <= closedJobLag
 }
 
 func readStateString(state map[string]json.RawMessage, key string) string {
@@ -2597,6 +3079,24 @@ func (m *module) updateAxisMotion(deviceID string, state map[string]json.RawMess
 	return !prev.LastMovedAt.IsZero() && now.Sub(prev.LastMovedAt) < settleWindow
 }
 
+// stateUnreachable is the state a refused turn-off names for a printer that
+// is not connected.
+const stateUnreachable = "UNREACHABLE"
+
+// offRefusal says whether a request to turn a printer off is refused, and
+// with what reason and state. idleOnly is a request that is to turn off idle
+// printers only: a printer Connect cannot reach may be printing, so it is
+// refused too.
+func offRefusal(safety printerSafety, idleOnly bool) (reason, state string, refused bool) {
+	if !safety.CanTurnOff {
+		return safety.LockReason, safety.PrinterState, true
+	}
+	if idleOnly && !safety.Connected {
+		return "Connect cannot reach the printer", stateUnreachable, true
+	}
+	return "", "", false
+}
+
 func (m *module) checkSafety(ctx context.Context, principal, deviceID string) (printerSafety, error) {
 	dev, err := m.devices.Get(ctx, deviceapi.GetParams{Principal: principal, ID: deviceID})
 	if err != nil {
@@ -2618,8 +3118,12 @@ func (m *module) checkSafety(ctx context.Context, principal, deviceID string) (p
 	activeJob := err == nil && jobs.Current != nil && jobs.Current.Ended == nil
 
 	var jobID, jobFile, lastJobID, lastJobOutcome string
+	var jobStarted time.Time
+	var lastJobEnded *time.Time
+	var jobOver bool
 	if err == nil {
 		if jobs.Current != nil && jobs.Current.Ended == nil {
+			jobStarted = jobs.Current.Started
 			jobID = strings.TrimSpace(jobs.Current.ID)
 			if jobID == "" {
 				jobID = strings.TrimSpace(jobs.Current.DeviceJobID)
@@ -2629,13 +3133,20 @@ func (m *module) checkSafety(ctx context.Context, principal, deviceID string) (p
 		if jobs.Last != nil {
 			lastJobID = strings.TrimSpace(jobs.Last.ID)
 			lastJobOutcome = strings.TrimSpace(jobs.Last.Outcome)
+			if jobs.Last.Ended != nil {
+				ended := *jobs.Last.Ended
+				lastJobEnded = &ended
+			}
 		}
 	}
 	if jobFile == "" {
 		stateDisplay := readStateString(dev.State, "/job/display")
 		statePath := readStateString(dev.State, "/job/path")
 		stateJobID := readStateToken(dev.State, "/job/id")
-		if jobID == "" && stateJobID != "" {
+		if err == nil && closedJobStillNamed(jobs, stateJobID, m.clock()) {
+			jobOver = true
+			jobID = lastJobID
+		} else if jobID == "" && stateJobID != "" {
 			jobID = stateJobID
 		}
 		jobFile = cleanJobFileName(stateDisplay, statePath, stateJobID)
@@ -2654,6 +3165,9 @@ func (m *module) checkSafety(ctx context.Context, principal, deviceID string) (p
 		JobFile:        jobFile,
 		LastJobID:      lastJobID,
 		LastJobOutcome: lastJobOutcome,
+		JobStarted:     jobStarted,
+		LastJobEnded:   lastJobEnded,
+		JobOver:        jobOver,
 	}
 
 	if !dev.Connected {
@@ -2682,10 +3196,10 @@ func (m *module) checkSafety(ctx context.Context, principal, deviceID string) (p
 	return s, nil
 }
 
-func accumulateEnergy(now, startedAt time.Time, watts float64, dt time.Duration, integrate bool, durationSec *int, energyWh, avgWatts, peakWatts *float64) {
-	if integrate && dt > 0 {
-		*energyWh += watts * dt.Hours()
-	}
+// accumulateEnergy adds wh, the energy of this tick as energyStepLocked
+// decided it, and brings the duration, the peak and the average up to now.
+func accumulateEnergy(now, startedAt time.Time, watts, wh float64, durationSec *int, energyWh, avgWatts, peakWatts *float64) {
+	*energyWh += wh
 	*durationSec = int(now.Sub(startedAt).Seconds())
 	if watts > *peakWatts {
 		*peakWatts = watts
@@ -2712,23 +3226,34 @@ func (m *module) updateDeviceUsage(deviceID string, cfg DeviceConfig, safety pri
 	}
 
 	watts := 0.0
-	if plugOn && p.PowerWatts != nil && *p.PowerWatts >= 0 {
-		watts = *p.PowerWatts
+	if w, ok := meterWatts(p); ok && plugOn {
+		watts = w
 	}
 
-	now := time.Now()
+	now := m.clock()
 	u := m.usage[deviceID]
 	if u == nil {
 		u = &DeviceUsage{}
 		m.usage[deviceID] = u
 	}
 
+	// prevSampleAt is the sample before this tick. A print that is found
+	// ended after a long time with no sample ended somewhere in that time.
+	prevSampleAt := u.LastSampleAt
 	sampleDue := u.LastSampleAt.IsZero() || now.Sub(u.LastSampleAt) >= 2*time.Second
 	var dt time.Duration
+	// step is what this tick adds. The session, the print and the 15-minute
+	// slot all take it, so they never disagree. It is zero when no sample is
+	// due.
+	var step energyStep
 	if sampleDue {
 		if !u.LastSampleAt.IsZero() && now.After(u.LastSampleAt) && now.Sub(u.LastSampleAt) <= 2*time.Minute {
 			dt = now.Sub(u.LastSampleAt)
 		}
+		step = m.energyStepLocked(cfg, p, now, dt, plugOn)
+		// The slots take the step at the end, once it is known whether it
+		// went into a print.
+		defer func() { m.recordEnergyLocked(deviceID, now.Add(-dt), now, step) }()
 		u.LastSampleAt = now
 		u.History = append(u.History, PowerSample{
 			Timestamp: now.Unix(),
@@ -2742,11 +3267,12 @@ func (m *module) updateDeviceUsage(deviceID string, cfg DeviceConfig, safety pri
 			u.Session = &PowerSession{
 				Active:    true,
 				StartedAt: now,
+				EnergyWh:  step.wh,
 				PeakWatts: watts,
 			}
 			dirtyDisk = true
 		} else {
-			accumulateEnergy(now, u.Session.StartedAt, watts, dt, sampleDue,
+			accumulateEnergy(now, u.Session.StartedAt, watts, step.wh,
 				&u.Session.DurationSec, &u.Session.EnergyWh, &u.Session.AvgWatts, &u.Session.PeakWatts)
 		}
 	} else if plugOff && u.Session != nil && u.Session.Active {
@@ -2760,23 +3286,63 @@ func (m *module) updateDeviceUsage(deviceID string, cfg DeviceConfig, safety pri
 		dirtyDisk = true
 	}
 
-	printingNow := safety.Connected && (safety.ActiveJob || safety.PrinterState == "PRINTING" || safety.PrinterState == "PAUSED")
-	finishingMoves := u.CurrentPrint != nil && u.CurrentPrint.Active && safety.Connected && safety.Moving
+	rec := u.CurrentPrint
+	open := func() bool { return u.CurrentPrint != nil && u.CurrentPrint.Active }
+	host := m.hostJobs[deviceID]
+
+	printingNow := safety.Connected && !safety.JobOver && (safety.ActiveJob || safety.PrinterState == "PRINTING" || safety.PrinterState == "PAUSED")
+	finishingMoves := open() && safety.Connected && safety.Moving
 	printActive := printingNow || finishingMoves
 
-	finalizeCurrentPrint := func(outcome string) {
-		if u.CurrentPrint == nil || !u.CurrentPrint.Active {
+	// finalizeCurrentPrint closes the running print. outcome is empty when it
+	// is to be read from the server's job record and the printer's state.
+	// endAt is zero for a print that ended now, and else the moment the print
+	// was last known to run.
+	finalizeCurrentPrint := func(outcome string, endAt time.Time) {
+		if !open() {
 			return
 		}
-		u.CurrentPrint.Active = false
+		cur := u.CurrentPrint
+		_, knownEnd, known := jobFacts(host, cur.JobID, safety)
+		cur.Active = false
+		cur.AwaySince = nil
 		ended := now
-		u.CurrentPrint.EndedAt = &ended
-		u.CurrentPrint.DurationSec = int(now.Sub(u.CurrentPrint.StartedAt).Seconds())
-		if u.CurrentPrint.DurationSec > 0 {
-			u.CurrentPrint.AvgWatts = u.CurrentPrint.EnergyWh / (float64(u.CurrentPrint.DurationSec) / 3600.0)
+		switch {
+		case !endAt.IsZero():
+			// The print was lost sight of at endAt. The server's record of
+			// its end counts when it has one that is not earlier.
+			ended = endAt
+			cur.EndEstimated = true
+			if knownEnd != nil && outcome != "interrupted" && !knownEnd.Before(endAt) {
+				ended = *knownEnd
+				cur.EndEstimated = false
+			}
+		case !prevSampleAt.IsZero() && now.Sub(prevSampleAt) > 2*time.Minute:
+			// Nothing was sampled for a while, for one because the extension
+			// was not running. The print ended in that time, and the last
+			// sample is the latest moment it is known to have run.
+			ended = prevSampleAt
+			cur.EndEstimated = true
+		case knownEnd != nil:
+			ended = *knownEnd
+		}
+		if ended.After(now) {
+			ended = now
+		}
+		if ended.Before(cur.StartedAt) {
+			ended = cur.StartedAt
+		}
+		cur.EndedAt = &ended
+		cur.DurationSec = int(ended.Sub(cur.StartedAt).Seconds())
+		cur.MeteredSec = math.Round(cur.MeteredSec)
+		if cur.DurationSec > 0 {
+			cur.AvgWatts = cur.EnergyWh / (float64(cur.DurationSec) / 3600.0)
 		}
 		if outcome == "" {
-			if safety.LastJobID != "" && safety.LastJobID == u.CurrentPrint.JobID && safety.LastJobOutcome != "" {
+			outcome = known
+		}
+		if outcome == "" {
+			if safety.LastJobID != "" && safety.LastJobID == cur.JobID && safety.LastJobOutcome != "" {
 				outcome = safety.LastJobOutcome
 			} else if safety.PrinterState == "STOPPED" {
 				outcome = "cancelled"
@@ -2784,30 +3350,90 @@ func (m *module) updateDeviceUsage(deviceID string, cfg DeviceConfig, safety pri
 				outcome = "finished"
 			}
 		}
-		u.CurrentPrint.Outcome = outcome
-		doneCopy := *u.CurrentPrint
+		cur.Outcome = outcome
+		doneCopy := *cur
 		u.PrintHistory = append([]PrintPowerRecord{doneCopy}, u.PrintHistory...)
 		if len(u.PrintHistory) > maxPrintHistory {
 			u.PrintHistory = u.PrintHistory[:maxPrintHistory]
 		}
+		m.queuePrintLocked(deviceID, doneCopy)
 		dirtyDisk = true
 	}
 
-	if printActive {
-		if u.CurrentPrint != nil && u.CurrentPrint.Active && safety.JobID != "" && u.CurrentPrint.JobID != "" && u.CurrentPrint.JobID != safety.JobID {
-			finalizeCurrentPrint("finished")
+	// A printer that drops off the network says nothing about its print. The
+	// record stays open: for printAwayGrace it goes on counting, after that
+	// it waits, and it is closed only when the print is known to be over.
+	hold := false
+	switch {
+	case !open():
+	case !safety.Connected:
+		if plugOff {
+			// No power, no print.
+			at := now
+			if rec.AwaySince != nil {
+				at = *rec.AwaySince
+			}
+			finalizeCurrentPrint("interrupted", at)
+			break
 		}
-		if u.CurrentPrint == nil || !u.CurrentPrint.Active {
+		if rec.AwaySince == nil {
+			at := now
+			rec.AwaySince = &at
+			dirtyDisk = true
+		}
+		switch away := now.Sub(*rec.AwaySince); {
+		case away > printAwayMax:
+			finalizeCurrentPrint("interrupted", *rec.AwaySince)
+		case away <= printAwayGrace:
+			printActive = true
+		default:
+			hold = true
+		}
+	case rec.AwaySince != nil:
+		switch {
+		case sameJob(rec, safety) && stateRunning(safety):
+			rec.AwaySince = nil
+			dirtyDisk = true
+			printActive = true
+		case safety.ActiveJob && sameJob(rec, safety) && now.Sub(*rec.AwaySince) <= printAwayMax:
+			// The server still holds the print open and the printer has not
+			// said yet what it does.
+			hold = true
+		default:
+			finalizeCurrentPrint(outcomeAfterAbsence(rec, safety, host), *rec.AwaySince)
+		}
+	}
+
+	switch {
+	case hold:
+	case printActive:
+		if open() && safety.Connected && safety.JobID != "" && u.CurrentPrint.JobID != "" && u.CurrentPrint.JobID != safety.JobID {
+			finalizeCurrentPrint("", time.Time{})
+		}
+		// This step's energy goes into a print record, so the print share of
+		// the slots equals the print records.
+		step.printing = true
+		if !open() {
 			fileName := safety.JobFile
 			if fileName == "" {
 				fileName = "Active Print"
+			}
+			// The server's record of the start counts when it lies in this
+			// step. An older one is a print that ran before it was seen here.
+			startedAt := now
+			if at, _, _ := jobFacts(host, safety.JobID, safety); !at.IsZero() && at.After(prevSampleAt) && !at.After(now) && now.Sub(at) <= 2*time.Minute {
+				startedAt = at
 			}
 			u.CurrentPrint = &PrintPowerRecord{
 				JobID:     safety.JobID,
 				FileName:  fileName,
 				Active:    true,
-				StartedAt: now,
+				StartedAt: startedAt,
+				EnergyWh:  step.wh,
 				PeakWatts: watts,
+			}
+			if step.metered {
+				u.CurrentPrint.MeteredSec = dt.Seconds()
 			}
 			dirtyDisk = true
 		} else {
@@ -2818,15 +3444,443 @@ func (m *module) updateDeviceUsage(deviceID string, cfg DeviceConfig, safety pri
 				u.CurrentPrint.FileName = safety.JobFile
 				dirtyDisk = true
 			}
-			accumulateEnergy(now, u.CurrentPrint.StartedAt, watts, dt, plugOn && sampleDue,
+			accumulateEnergy(now, u.CurrentPrint.StartedAt, watts, step.wh,
 				&u.CurrentPrint.DurationSec, &u.CurrentPrint.EnergyWh, &u.CurrentPrint.AvgWatts, &u.CurrentPrint.PeakWatts)
+			if step.metered {
+				u.CurrentPrint.MeteredSec += dt.Seconds()
+			}
 		}
-	} else if u.CurrentPrint != nil && u.CurrentPrint.Active {
-		finalizeCurrentPrint("")
+	case open():
+		finalizeCurrentPrint("", time.Time{})
 	}
 
-	active = (u.Session != nil && u.Session.Active) || (u.CurrentPrint != nil && u.CurrentPrint.Active)
+	active = (u.Session != nil && u.Session.Active) || open()
 	return dirtyDisk, active
+}
+
+// printAwayGrace is how long a print goes on counting energy while its
+// printer is away. printAwayMax is how long its record is kept open.
+const (
+	printAwayGrace = 15 * time.Minute
+	printAwayMax   = 24 * time.Hour
+)
+
+// sameJob reports whether the printer may be on the print of rec: it is,
+// unless both name their print and the names differ.
+func sameJob(rec *PrintPowerRecord, s printerSafety) bool {
+	return rec.JobID == "" || s.JobID == "" || rec.JobID == s.JobID
+}
+
+// stateRunning reports a printer that says it is on a print.
+func stateRunning(s printerSafety) bool {
+	return s.PrinterState == "PRINTING" || s.PrinterState == "PAUSED" || s.PrinterState == "ATTENTION"
+}
+
+// knownOutcome is how a print ended in the words of the print table, or
+// empty for a word that says nothing.
+func knownOutcome(raw string) string {
+	switch word := strings.ToLower(strings.TrimSpace(raw)); word {
+	case "finished", "cancelled", "failed":
+		return word
+	}
+	return ""
+}
+
+// jobFacts is what the server's job record says about the print jobID: when
+// it started, when it ended and how. The event stream is read first
+// (jobfeed.go), then the row the poll carries. Every answer is empty where
+// neither names that print.
+func jobFacts(host hostJob, jobID string, s printerSafety) (started time.Time, ended *time.Time, outcome string) {
+	if jobID == "" {
+		return time.Time{}, nil, ""
+	}
+	if host.JobID == jobID {
+		started, ended, outcome = host.Started, host.Ended, knownOutcome(host.Outcome)
+	}
+	if started.IsZero() && s.JobID == jobID {
+		started = s.JobStarted
+	}
+	if s.LastJobID == jobID {
+		if ended == nil {
+			ended = s.LastJobEnded
+		}
+		if outcome == "" {
+			outcome = knownOutcome(s.LastJobOutcome)
+		}
+	}
+	return started, ended, outcome
+}
+
+// outcomeAfterAbsence is how the print of rec ended, read when its printer
+// is back and no longer on it. A print nothing says to be over in its own
+// way was cut.
+func outcomeAfterAbsence(rec *PrintPowerRecord, s printerSafety, host hostJob) string {
+	if _, _, outcome := jobFacts(host, rec.JobID, s); outcome != "" {
+		return outcome
+	}
+	if rec.JobID != "" && s.LastJobID == rec.JobID {
+		return "interrupted"
+	}
+	switch s.PrinterState {
+	case "FINISHED":
+		return "finished"
+	case "STOPPED":
+		return "cancelled"
+	case "ERROR":
+		return "failed"
+	}
+	return "interrupted"
+}
+
+// --- An armed auto-off kept over a restart ---
+
+// autoOffFileName holds what the auto-off logic follows of each printer, so
+// that a restart of the server or the extension does not lose a print that
+// was seen running or a wait that began.
+const autoOffFileName = "autooff.json"
+
+type savedTracker struct {
+	SawActive  bool       `json:"saw_active"`
+	FinishedAt *time.Time `json:"finished_at,omitempty"`
+	Fired      bool       `json:"fired"`
+	JobID      string     `json:"job_id,omitempty"`
+	Kept       string     `json:"kept,omitempty"`
+}
+
+type savedSkip struct {
+	SawPrint bool   `json:"saw_print"`
+	Ended    bool   `json:"ended"`
+	JobID    string `json:"job_id,omitempty"`
+}
+
+// savedIdle is since when a printer is on with nothing to do.
+type savedIdle struct {
+	Since time.Time `json:"since"`
+}
+
+type savedPrinter struct {
+	Tracker *savedTracker `json:"tracker,omitempty"`
+	Skip    *savedSkip    `json:"skip,omitempty"`
+	Idle    *savedIdle    `json:"idle,omitempty"`
+}
+
+type savedAutoOff struct {
+	V        int                      `json:"v"`
+	Printers map[string]*savedPrinter `json:"printers"`
+}
+
+// autoOffSnapshotLocked is what autooff.json is to hold. A printer nothing
+// is followed of is left out. Why a turn-off failed is not kept: the next
+// try says it again.
+func (m *module) autoOffSnapshotLocked() savedAutoOff {
+	out := savedAutoOff{V: 1, Printers: make(map[string]*savedPrinter)}
+	of := func(id string) *savedPrinter {
+		p := out.Printers[id]
+		if p == nil {
+			p = &savedPrinter{}
+			out.Printers[id] = p
+		}
+		return p
+	}
+	for id, tr := range m.trackers {
+		if tr == nil || (!tr.sawActive && tr.finishedAt == nil && !tr.fired && tr.jobID == "" && tr.kept == "") {
+			continue
+		}
+		saved := &savedTracker{SawActive: tr.sawActive, Fired: tr.fired, JobID: tr.jobID, Kept: tr.kept}
+		if tr.finishedAt != nil {
+			at := tr.finishedAt.UTC()
+			saved.FinishedAt = &at
+		}
+		of(id).Tracker = saved
+	}
+	for id, skip := range m.skips {
+		if skip == nil || *skip == (skippedPrint{}) {
+			continue
+		}
+		of(id).Skip = &savedSkip{SawPrint: skip.sawPrint, Ended: skip.ended, JobID: skip.jobID}
+	}
+	for id, clock := range m.idle {
+		if clock == nil || clock.since.IsZero() {
+			continue
+		}
+		of(id).Idle = &savedIdle{Since: clock.since.UTC()}
+	}
+	return out
+}
+
+// saveAutoOffIfChanged writes autooff.json when what it is to hold differs
+// from what it holds.
+func (m *module) saveAutoOffIfChanged() {
+	m.autoOffSaveMu.Lock()
+	defer m.autoOffSaveMu.Unlock()
+	m.mu.RLock()
+	dir := m.dataDir
+	raw, err := json.Marshal(m.autoOffSnapshotLocked())
+	same := err == nil && string(raw) == string(m.autoOffSaved)
+	m.mu.RUnlock()
+	if dir == "" || err != nil || same {
+		return
+	}
+	if err = writeFileAtomic(filepath.Join(dir, autoOffFileName), raw); err != nil {
+		fmt.Fprintf(os.Stderr, "%s: save auto-off state: %v\n", logName, err)
+		return
+	}
+	m.mu.Lock()
+	m.autoOffSaved = raw
+	m.mu.Unlock()
+}
+
+// loadAutoOff reads autooff.json. Only what still fits a printer's config is
+// taken: a print is followed for a printer that is armed, and a skipped print
+// for one that turns off by default and is switched off for now.
+func (m *module) loadAutoOff() {
+	m.mu.RLock()
+	dir := m.dataDir
+	m.mu.RUnlock()
+	if dir == "" {
+		return
+	}
+
+	empty, _ := json.Marshal(savedAutoOff{V: 1, Printers: map[string]*savedPrinter{}})
+	raw, err := os.ReadFile(filepath.Join(dir, autoOffFileName))
+	var loaded savedAutoOff
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		raw = empty
+	case err != nil:
+		fmt.Fprintf(os.Stderr, "%s: read auto-off state: %v\n", logName, err)
+		raw = nil
+	default:
+		if err = json.Unmarshal(raw, &loaded); err != nil || loaded.V > 1 {
+			fmt.Fprintf(os.Stderr, "%s: %s could not be used and is ignored\n", logName, autoOffFileName)
+			loaded, raw = savedAutoOff{}, nil
+		}
+	}
+
+	now := m.clock()
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	// A file that could not be used is written anew on the first change.
+	m.autoOffSaved = raw
+	for id, saved := range loaded.Printers {
+		cfg, ok := m.configs[id]
+		if !ok || saved == nil {
+			continue
+		}
+		if tr := saved.Tracker; tr != nil && cfg.AutoOffAfterPrint {
+			restored := &autoOffTracker{sawActive: tr.SawActive, fired: tr.Fired, jobID: tr.JobID, kept: tr.Kept, restored: true}
+			// A wait runs on only when the extension was away for a moment,
+			// as the idle time does. After a longer stop the printer may
+			// have been turned on again, and the wait starts anew.
+			fresh := false
+			if u := m.usage[id]; u != nil && !u.LastSampleAt.IsZero() {
+				gap := now.Sub(u.LastSampleAt)
+				fresh = gap >= 0 && gap <= idleGapGrace
+			}
+			if fresh && tr.FinishedAt != nil && tr.FinishedAt.UTC().Year() >= minSaneYear {
+				at := *tr.FinishedAt
+				restored.finishedAt = &at
+			}
+			m.trackers[id] = restored
+		}
+		if skip := saved.Skip; skip != nil && !cfg.AutoOffAfterPrint && cfg.AutoOffDefault {
+			m.skips[id] = &skippedPrint{sawPrint: skip.SawPrint, ended: skip.Ended, jobID: skip.JobID}
+		}
+		// The idle time runs on only when the extension was away for a
+		// moment. When it last looked is the last sample of that printer.
+		if idle := saved.Idle; idle != nil && idle.Since.UTC().Year() >= minSaneYear {
+			clock := &idleClock{since: idle.Since}
+			if u := m.usage[id]; u != nil {
+				clock.seen = u.LastSampleAt
+			}
+			m.idle[id] = clock
+		}
+	}
+}
+
+// --- A printer that is on and idle ---
+
+const (
+	// idleAwayGrace is how long a printer may be away before its idle time
+	// starts again. Nobody knows what it did while it was away.
+	idleAwayGrace = 2 * time.Minute
+	// idleGapGrace is how long the extension may not have looked. After a
+	// longer stop, or a jump of the clock, the idle time starts again.
+	idleGapGrace = 10 * time.Minute
+)
+
+// idleClock follows one printer an idle time counts for.
+type idleClock struct {
+	// since is from when the printer is on, connected and free to be turned
+	// off. It is zero while it is not.
+	since time.Time
+	// seen is the last tick, and away the first tick the printer was away.
+	seen, away time.Time
+	// fault is why the plug could not be turned off when the time was over.
+	fault string
+}
+
+// idleLimit is the idle time that counts for a printer: its own, or the one
+// for all printers. 0 never turns it off.
+func idleLimit(cfg DeviceConfig, s Settings) time.Duration {
+	minutes := s.IdleOffMin
+	if cfg.IdleOffMin != nil {
+		minutes = *cfg.IdleOffMin
+	}
+	return time.Duration(clampIdleOffMin(minutes)) * time.Minute
+}
+
+// idleTick follows a printer for one tick and reports whether its plug is to
+// be turned off now. The time runs only while the printer is connected, its
+// plug is not known to be off and the interlock would let it be turned off:
+// printing, a paused print, a busy printer and moving axes all start it again.
+func (m *module) idleTick(deviceID string, cfg DeviceConfig, safety printerSafety, limit time.Duration, now time.Time) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if limit <= 0 {
+		delete(m.idle, deviceID)
+		return false
+	}
+	clock := m.idle[deviceID]
+	if clock == nil {
+		clock = &idleClock{}
+		m.idle[deviceID] = clock
+	}
+
+	// Time nobody watched does not count as idle time.
+	if !clock.since.IsZero() && (now.Sub(clock.seen) > idleGapGrace || now.Before(clock.since)) {
+		clock.since = now
+	}
+	clock.seen = now
+
+	if !safety.Connected {
+		if clock.away.IsZero() {
+			clock.away = now
+		}
+		if now.Sub(clock.away) > idleAwayGrace {
+			clock.since = time.Time{}
+		}
+		return false
+	}
+	clock.away = time.Time{}
+
+	plug := m.plugs[cfg.plugKey()]
+	state := "UNKNOWN"
+	if plug != nil {
+		state = plug.relayState(cfg.relayIndex())
+	}
+	if state == "OFF" || !safety.CanTurnOff {
+		clock.since = time.Time{}
+		clock.fault = ""
+		return false
+	}
+	// While the turn-off after a print waits, that wait counts alone. The
+	// idle time starts when it is over or was called off.
+	if tr := m.trackers[deviceID]; cfg.AutoOffAfterPrint && tr != nil && tr.finishedAt != nil {
+		clock.since = time.Time{}
+		clock.fault = ""
+		return false
+	}
+	if clock.since.IsZero() {
+		clock.since = now
+	}
+
+	return state == "ON" && !m.plugStaleLocked(cfg, plug) && now.Sub(clock.since) >= limit
+}
+
+// keepOn starts a printer's idle time again. It reports whether one ran.
+func (m *module) keepOn(deviceID string, now time.Time) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	clock := m.idle[deviceID]
+	if clock == nil || clock.since.IsZero() {
+		return false
+	}
+	clock.since = now
+	clock.fault = ""
+	return true
+}
+
+// idleStillDue reports whether a printer's idle time is still over. It is
+// asked just before the plug is turned off.
+func (m *module) idleStillDue(deviceID string, limit time.Duration, now time.Time) bool {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	clock := m.idle[deviceID]
+	return clock != nil && !clock.since.IsZero() && now.Sub(clock.since) >= limit
+}
+
+// noteIdleFault keeps why the plug could not be turned off after the idle
+// time. It reports whether this is the first failure of this turn-off.
+func (m *module) noteIdleFault(deviceID string, err error) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	clock := m.idle[deviceID]
+	if clock == nil {
+		return false
+	}
+	first := clock.fault == ""
+	clock.fault = err.Error()
+	return first
+}
+
+// idleState is what a page shows of a printer's idle time: the time that
+// counts in minutes, how many seconds are left while it runs, and why the
+// turn-off failed. The caller holds m.mu.
+func (m *module) idleStateLocked(deviceID string, cfg DeviceConfig, s Settings, now time.Time) (limitMin int, remaining *int, fault string) {
+	limit := idleLimit(cfg, s)
+	limitMin = int(limit / time.Minute)
+	clock := m.idle[deviceID]
+	if limit <= 0 || clock == nil {
+		return limitMin, nil, ""
+	}
+	fault = clock.fault
+	plug := m.plugs[cfg.plugKey()]
+	if clock.since.IsZero() || plug == nil || plug.relayState(cfg.relayIndex()) != "ON" {
+		return limitMin, nil, fault
+	}
+	left := max(0, int(math.Ceil((limit - now.Sub(clock.since)).Seconds())))
+	return limitMin, &left, fault
+}
+
+// idleStep turns a printer off whose idle time is over. recheck reads the
+// printer once more just before, like the turn-off after a print does.
+func (m *module) idleStep(ctx context.Context, deviceID string, cfg DeviceConfig, safety printerSafety, recheck func() (printerSafety, error)) {
+	limit := idleLimit(cfg, m.settings())
+	if !m.idleTick(deviceID, cfg, safety, limit, m.clock()) {
+		return
+	}
+	again, err := recheck()
+	if err != nil || !again.Connected || !again.CanTurnOff {
+		return
+	}
+	// "Keep on" may have been pressed while the printer was read again.
+	if !m.idleStillDue(deviceID, limit, m.clock()) {
+		return
+	}
+
+	if err := m.switchDevicePower(ctx, cfg, false); err != nil {
+		first := m.noteIdleFault(deviceID, err)
+		fmt.Fprintf(os.Stderr, "%s: idle-off failed for printer %q [%s]: %v\n", logName, safety.DeviceName, deviceID, err)
+		if first {
+			m.emitEvent(ctx, endpointAutoOffFailed, deviceID, autoOffEvent{
+				DeviceID: deviceID, DeviceName: safety.DeviceName, Reason: reasonIdle, Error: m.scrubText(err.Error()),
+			})
+		}
+		return
+	}
+
+	fmt.Fprintf(os.Stderr, "%s: idle-off triggered for printer %q [%s] (plug %s relay %d)\n", logName, safety.DeviceName, deviceID, cfg.plugKey(), cfg.relayIndex())
+	m.mu.Lock()
+	delete(m.idle, deviceID)
+	m.mu.Unlock()
+	m.emitEvent(ctx, endpointAutoOffDone, deviceID, autoOffEvent{
+		DeviceID: deviceID, DeviceName: safety.DeviceName, Reason: reasonIdle,
+	})
 }
 
 // --- Background Auto-Off & Usage Polling Loop ---
@@ -2909,9 +3963,32 @@ func (m *module) autoOffDue(deviceID string, safety printerSafety, cooldown time
 
 	// A printer that is away says nothing about its print, so a lost
 	// connection never cuts the power mid-print. A print already seen to be
-	// over stays over: the wait that began then runs on.
+	// over stays over: the wait that began then runs on. After a restart
+	// nothing is known of the printer until it was seen once: it may have
+	// started its next print while nobody watched.
+	// The server's record of the print is still read: a print it records as
+	// cancelled or failed keeps the power on, and one with no outcome yet
+	// gets the same outcomeGrace as a printer that is there.
 	if !safety.Connected {
-		return tr.finishedAt != nil && now.Sub(*tr.finishedAt) >= cooldown
+		if tr.restored || tr.finishedAt == nil {
+			return false
+		}
+		how, reason := safety.printEnd(tr.jobID)
+		if how == endNotFinished {
+			*tr = autoOffTracker{fired: true, kept: reason}
+			return false
+		}
+		return now.Sub(*tr.finishedAt) >= autoOffWait(how, cooldown)
+	}
+
+	// The first look after a restart. A print the printer and the server no
+	// longer name was left behind while nobody watched: it is dropped, and
+	// the printer waits for its next print.
+	if tr.restored {
+		tr.restored = false
+		if tr.jobID != "" && safety.JobID != tr.jobID && safety.LastJobID != tr.jobID {
+			*tr = autoOffTracker{fired: true}
+		}
 	}
 
 	if !safety.CanTurnOff {
@@ -2944,25 +4021,34 @@ func (m *module) autoOffDue(deviceID string, safety printerSafety, cooldown time
 		tr.finishedAt = &at
 	}
 
-	// The server records how a print ended a moment after the printer stops.
-	// Until it has, the wait is at least outcomeGrace, so a short wait does
-	// not turn off a printer whose print turns out to be cancelled.
-	wait := cooldown
-	if how == endUnknown && wait < outcomeGrace {
-		wait = outcomeGrace
-	}
+	return now.Sub(*tr.finishedAt) >= autoOffWait(how, cooldown)
+}
 
-	return now.Sub(*tr.finishedAt) >= wait
+// autoOffWait is how long after a print ended the plug is turned off. The
+// server records how a print ended a moment after the printer stops. Until it
+// has, the wait is at least outcomeGrace, so a short wait does not turn off a
+// printer whose print turns out to be cancelled.
+func autoOffWait(how printEnd, cooldown time.Duration) time.Duration {
+	if how == endUnknown && cooldown < outcomeGrace {
+		return outcomeGrace
+	}
+	return cooldown
 }
 
 // noteAutoOffFault keeps why the plug could not be turned off after a print,
 // for the printer's page to show while the turn-off is tried again.
-func (m *module) noteAutoOffFault(deviceID string, err error) {
+// It reports whether this is the first failure of this turn-off.
+func (m *module) noteAutoOffFault(deviceID string, err error) bool {
 	m.mu.Lock()
-	if tr, ok := m.trackers[deviceID]; ok {
-		tr.offFault = err.Error()
+	defer m.mu.Unlock()
+
+	tr, ok := m.trackers[deviceID]
+	if !ok {
+		return false
 	}
-	m.mu.Unlock()
+	first := tr.offFault == ""
+	tr.offFault = err.Error()
+	return first
 }
 
 // plugIsOff reports whether the printer's plug is known to be off. A plug
@@ -3041,7 +4127,118 @@ func (m *module) skippedPrintIsOver(deviceID string, safety printerSafety) bool 
 	return false
 }
 
+// stepPrinter is what one tick does for one printer, once its state is read:
+// the usage record, the word that its plug went away during a print, the
+// turn-off after a print, and the turn-off of a printer left on and idle.
+// recheck reads the printer once more, just before a plug is turned off.
+func (m *module) stepPrinter(ctx context.Context, deviceID string, cfg DeviceConfig, safety printerSafety, recheck func() (printerSafety, error)) (dirty, active bool) {
+	dirty, active = m.updateDeviceUsage(deviceID, cfg, safety)
+
+	if cause, due := m.plugLostDue(deviceID, cfg, safety, m.clock()); due {
+		m.emitEvent(ctx, endpointPlugLost, deviceID, plugLostEvent{
+			DeviceID: deviceID, DeviceName: safety.DeviceName, JobID: safety.JobID,
+			Driver: cfg.effectiveDriver(), Cause: cause,
+		})
+	}
+
+	if !m.afterPrintStep(ctx, deviceID, cfg, safety, recheck) {
+		m.idleStep(ctx, deviceID, cfg, safety, recheck)
+	}
+	return dirty, active
+}
+
+// updateConfig applies change to the config saved for deviceID now, not to
+// the copy a tick began with, and saves it. A person may have saved the
+// config while the tick waited for a plug. Nothing is saved when the printer
+// is gone or its plug or relay is no longer the one in was.
+func (m *module) updateConfig(deviceID string, was DeviceConfig, change func(*DeviceConfig)) {
+	m.configsSaveMu.Lock()
+	defer m.configsSaveMu.Unlock()
+	m.mu.Lock()
+	cur, ok := m.configs[deviceID]
+	if !ok || cur.plugKey() != was.plugKey() || cur.relayIndex() != was.relayIndex() {
+		m.mu.Unlock()
+		return
+	}
+	change(&cur)
+	if err := m.storeConfigLocked(deviceID, cur); err != nil {
+		fmt.Fprintf(os.Stderr, "%s: save config: %v\n", logName, err)
+	}
+}
+
+// afterPrintStep turns a printer off that is armed, has finished its print
+// and has waited. It reports whether it turned the plug off.
+func (m *module) afterPrintStep(ctx context.Context, deviceID string, cfg DeviceConfig, safety printerSafety, recheck func() (printerSafety, error)) bool {
+	if !cfg.AutoOffAfterPrint {
+		// Switched off for one print on a printer that turns off by
+		// default: the default comes back when the print after it starts.
+		if cfg.AutoOffDefault && m.skippedPrintIsOver(deviceID, safety) {
+			m.updateConfig(deviceID, cfg, func(cur *DeviceConfig) {
+				if cur.AutoOffDefault {
+					cur.AutoOffAfterPrint = true
+				}
+			})
+		}
+		return false
+	}
+
+	cooldownSec := m.settings().AutoOffCooldownSec
+	if cfg.CooldownSec != nil {
+		cooldownSec = *cfg.CooldownSec
+	}
+
+	// A plug that is already off has nothing left to turn off. Whatever
+	// print was followed is over, and the next one starts from nothing.
+	if m.plugIsOff(cfg) {
+		m.forgetPrint(deviceID)
+		return false
+	}
+
+	if !m.autoOffDue(deviceID, safety, time.Duration(cooldownSec)*time.Second, m.clock()) {
+		return false
+	}
+
+	again, err := recheck()
+	if err != nil || !again.CanTurnOff {
+		return false
+	}
+
+	m.mu.RLock()
+	jobID := ""
+	if tr := m.trackers[deviceID]; tr != nil {
+		jobID = tr.jobID
+	}
+	m.mu.RUnlock()
+
+	if err := m.switchDevicePower(ctx, cfg, false); err != nil {
+		first := m.noteAutoOffFault(deviceID, err)
+		fmt.Fprintf(os.Stderr, "%s: auto-off failed for printer %q [%s]: %v\n", logName, safety.DeviceName, deviceID, err)
+		// One event for a turn-off that fails, not one for every try.
+		if first {
+			m.emitEvent(ctx, endpointAutoOffFailed, deviceID, autoOffEvent{
+				DeviceID: deviceID, DeviceName: safety.DeviceName, JobID: jobID,
+				Reason: reasonPrintFinished, Error: m.scrubText(err.Error()),
+			})
+		}
+		return false
+	}
+
+	fmt.Fprintf(os.Stderr, "%s: auto-off triggered for printer %q [%s] (plug %s relay %d)\n", logName, safety.DeviceName, deviceID, cfg.plugKey(), cfg.relayIndex())
+	m.afterAutoOff(deviceID, cfg)
+	m.updateConfig(deviceID, cfg, func(cur *DeviceConfig) {
+		cur.AutoOffAfterPrint = cur.AutoOffDefault
+	})
+	m.emitEvent(ctx, endpointAutoOffDone, deviceID, autoOffEvent{
+		DeviceID: deviceID, DeviceName: safety.DeviceName, JobID: jobID, Reason: reasonPrintFinished,
+	})
+	return true
+}
+
 func (m *module) stepAutoOff(ctx context.Context) {
+	// What this step changed of the prints it follows is on disk before the
+	// next one, so a restart goes on from there.
+	defer m.saveAutoOffIfChanged()
+
 	m.pollAssignedPlugsEnergy()
 
 	m.mu.RLock()
@@ -3054,10 +4251,10 @@ func (m *module) stepAutoOff(ctx context.Context) {
 	m.mu.RUnlock()
 
 	if len(assigned) == 0 {
+		m.flushEnergyIfDue()
 		return
 	}
 
-	defaultCooldown := m.settings().AutoOffCooldownSec
 	var anyDirty bool
 	var hasActiveUsage bool
 
@@ -3067,52 +4264,17 @@ func (m *module) stepAutoOff(ctx context.Context) {
 			continue
 		}
 
-		dirty, active := m.updateDeviceUsage(deviceID, cfg, safety)
+		dirty, active := m.stepPrinter(ctx, deviceID, cfg, safety, func() (printerSafety, error) {
+			return m.checkSafety(ctx, "", deviceID)
+		})
 		anyDirty = anyDirty || dirty
 		hasActiveUsage = hasActiveUsage || active
-
-		if !cfg.AutoOffAfterPrint {
-			// Switched off for one print on a printer that turns off by
-			// default: the default comes back when the print after it starts.
-			if cfg.AutoOffDefault && m.skippedPrintIsOver(deviceID, safety) {
-				cfg.AutoOffAfterPrint = true
-				_ = m.saveConfig(ctx, deviceID, cfg)
-			}
-			continue
-		}
-
-		cooldownSec := defaultCooldown
-		if cfg.CooldownSec != nil {
-			cooldownSec = *cfg.CooldownSec
-		}
-
-		// A plug that is already off has nothing left to turn off. Whatever
-		// print was followed is over, and the next one starts from nothing.
-		if m.plugIsOff(cfg) {
-			m.forgetPrint(deviceID)
-			continue
-		}
-
-		if !m.autoOffDue(deviceID, safety, time.Duration(cooldownSec)*time.Second, time.Now()) {
-			continue
-		}
-
-		recheck, err := m.checkSafety(ctx, "", deviceID)
-		if err != nil || !recheck.CanTurnOff {
-			continue
-		}
-
-		if err := m.switchDevicePower(ctx, cfg, false); err != nil {
-			m.noteAutoOffFault(deviceID, err)
-			fmt.Fprintf(os.Stderr, "%s: auto-off failed for printer %q [%s]: %v\n", logName, safety.DeviceName, deviceID, err)
-			continue
-		}
-
-		fmt.Fprintf(os.Stderr, "%s: auto-off triggered for printer %q [%s] (plug %s relay %d)\n", logName, safety.DeviceName, deviceID, cfg.plugKey(), cfg.relayIndex())
-		cfg = m.afterAutoOff(deviceID, cfg)
-		_ = m.saveConfig(ctx, deviceID, cfg)
 	}
 
+	// The energy record is written before usage.json. After a crash between
+	// the two, usage.json still names the print as running; the restart ends
+	// it again and the print store keeps the copy it already has.
+	m.flushEnergyIfDue()
 	if anyDirty || (hasActiveUsage && m.shouldPeriodicSaveUsage(60*time.Second)) {
 		if err := m.saveAllUsage(); err != nil {
 			fmt.Fprintf(os.Stderr, "%s: save usage: %v\n", logName, err)
@@ -3223,6 +4385,9 @@ type overviewEntry struct {
 	// CanOperate says whether the caller may switch this printer's plug. It
 	// only decides what the page offers: the routes ask again.
 	CanOperate bool `json:"can_operate"`
+	// IdleOffRemainingSec is how long until the plug is turned off because
+	// the printer is idle. It is left out while no idle time runs.
+	IdleOffRemainingSec *int `json:"idle_off_remaining_sec,omitempty"`
 }
 
 type overviewResponse struct {
@@ -3272,6 +4437,8 @@ func (m *module) plugSnapshotLocked(cfg DeviceConfig) *PlugTelemetry {
 		cp := p.clone()
 		relayIdx := cfg.relayIndex()
 		cp.Power = cp.relayState(relayIdx)
+		cp.Protection = cp.protectionOf(relayIdx)
+		cp.AfterPowerCut = cp.afterPowerCutOf(relayIdx)
 		if relayIdx > 1 && len(cp.RelayNames) >= relayIdx && cp.RelayNames[relayIdx-1] != "" {
 			cp.FriendlyName = cp.RelayNames[relayIdx-1]
 		}
@@ -3305,6 +4472,7 @@ func (m *module) buildOverview(opts overviewOptions) overviewResponse {
 		entry := overviewEntry{DeviceID: deviceID, Config: cfg.redacted()}
 		if cfg.configured() {
 			entry.Plug = m.plugSnapshotLocked(cfg)
+			_, entry.IdleOffRemainingSec, _ = m.idleStateLocked(deviceID, cfg, s, m.clock())
 			if held := m.usage[deviceID]; held != nil {
 				// Only the parts the overview answers are copied, so a poll
 				// does not copy an hour of samples it does not send.
@@ -3350,7 +4518,22 @@ func (m *module) buildOverview(opts overviewOptions) overviewResponse {
 // visibleDevices reads the printers principal may see, so a list this module
 // answers never names a printer the caller could not open.
 func (m *module) visibleDevices(ctx context.Context, principal string) (map[string]bool, error) {
-	seen := make(map[string]bool)
+	names, err := m.visiblePrinters(ctx, principal)
+	if err != nil {
+		return nil, err
+	}
+	seen := make(map[string]bool, len(names))
+	for id := range names {
+		seen[id] = true
+	}
+	return seen, nil
+}
+
+// visiblePrinters reads the printers principal may see with their names, the
+// id where a printer has none. An empty principal is the module itself, which
+// is every printer Connect lists.
+func (m *module) visiblePrinters(ctx context.Context, principal string) (map[string]string, error) {
+	seen := make(map[string]string)
 	for offset := 0; ; {
 		page, err := m.devices.List(ctx, deviceapi.ListParams{
 			Principal: principal,
@@ -3361,7 +4544,10 @@ func (m *module) visibleDevices(ctx context.Context, principal string) (map[stri
 			return nil, err
 		}
 		for _, dev := range page.Items {
-			seen[dev.ID] = true
+			seen[dev.ID] = dev.Name
+			if dev.Name == "" {
+				seen[dev.ID] = dev.ID
+			}
 		}
 		offset += len(page.Items)
 		if len(page.Items) == 0 || offset >= page.Total {
@@ -3388,15 +4574,25 @@ type statusResponse struct {
 	AutoOffRemainingSec int            `json:"auto_off_remaining_sec"`
 	// AutoOffError is why the plug could not be turned off after a print.
 	// AutoOffKept is why the printer stayed on: cancelled or failed.
-	AutoOffError       string             `json:"auto_off_error,omitempty"`
-	AutoOffKept        string             `json:"auto_off_kept,omitempty"`
-	DefaultCooldownSec int                `json:"default_cooldown_sec"`
-	ConfirmTurnOff     bool               `json:"confirm_turn_off"`
-	PollIntervalSec    int                `json:"poll_interval_sec"`
-	PowerHistory       []PowerSample      `json:"power_history,omitempty"`
-	SessionUsage       *PowerSession      `json:"session_usage,omitempty"`
-	CurrentPrintUsage  *PrintPowerRecord  `json:"current_print_usage,omitempty"`
-	PrintHistory       []PrintPowerRecord `json:"print_history,omitempty"`
+	AutoOffError       string         `json:"auto_off_error,omitempty"`
+	AutoOffKept        string         `json:"auto_off_kept,omitempty"`
+	DefaultCooldownSec int            `json:"default_cooldown_sec"`
+	ConfirmTurnOff     bool           `json:"confirm_turn_off"`
+	PollIntervalSec    int            `json:"poll_interval_sec"`
+	PowerHistory       []PowerSample  `json:"power_history,omitempty"`
+	SessionUsage       *pricedSession `json:"session_usage,omitempty"`
+	CurrentPrintUsage  *pricedPrint   `json:"current_print_usage,omitempty"`
+	PrintHistory       []pricedPrint  `json:"print_history,omitempty"`
+	// Currency and PriceSet go with the cost of the session and the prints.
+	Currency string `json:"currency"`
+	PriceSet bool   `json:"price_set"`
+	// IdleOffMin is the idle time that counts for this printer, 0 for none.
+	// IdleOffPending says the time runs, and IdleOffError why the plug could
+	// not be turned off when it was over.
+	IdleOffMin          int    `json:"idle_off_min"`
+	IdleOffPending      bool   `json:"idle_off_pending"`
+	IdleOffRemainingSec int    `json:"idle_off_remaining_sec"`
+	IdleOffError        string `json:"idle_off_error,omitempty"`
 }
 
 func (m *module) buildStatus(ctx context.Context, principal, deviceID string) (statusResponse, error) {
@@ -3411,6 +4607,7 @@ func (m *module) buildStatus(ctx context.Context, principal, deviceID string) (s
 
 	if cfg.configured() {
 		if dirty, _ := m.updateDeviceUsage(deviceID, cfg, safety); dirty {
+			m.flushEnergyIfDue()
 			_ = m.saveAllUsage()
 		}
 	}
@@ -3444,20 +4641,21 @@ func (m *module) buildStatus(ctx context.Context, principal, deviceID string) (s
 		}
 	}
 	usageCopy := cloneDeviceUsage(m.usage[deviceID])
+	idleMin, idleLeft, idleFault := m.idleStateLocked(deviceID, cfg, s, m.clock())
 	m.mu.RUnlock()
 
-	var (
-		historyCopy      []PowerSample
-		sessionCopy      *PowerSession
-		currentPrintCopy *PrintPowerRecord
-		printHistoryCopy []PrintPowerRecord
-	)
+	// The countdown shows only while the printer could be turned off.
+	idlePending := idleLeft != nil && safety.Connected && safety.CanTurnOff
+	idleRemaining := 0
+	if idlePending {
+		idleRemaining = *idleLeft
+	}
+
+	var historyCopy []PowerSample
 	if usageCopy != nil {
 		historyCopy = trimHistory(usageCopy.History, time.Now(), statusHistoryWindow)
-		sessionCopy = usageCopy.Session
-		currentPrintCopy = usageCopy.CurrentPrint
-		printHistoryCopy = usageCopy.PrintHistory
 	}
+	priced := m.priceUsage(deviceID, usageCopy, m.clock())
 
 	return statusResponse{
 		DeviceID:            deviceID,
@@ -3481,9 +4679,15 @@ func (m *module) buildStatus(ctx context.Context, principal, deviceID string) (s
 		ConfirmTurnOff:      s.confirmTurnOffEnabled(),
 		PollIntervalSec:     pollIntervalSec,
 		PowerHistory:        historyCopy,
-		SessionUsage:        sessionCopy,
-		CurrentPrintUsage:   currentPrintCopy,
-		PrintHistory:        printHistoryCopy,
+		SessionUsage:        priced.session,
+		CurrentPrintUsage:   priced.current,
+		PrintHistory:        priced.history,
+		Currency:            priced.currency,
+		PriceSet:            priced.priceSet,
+		IdleOffMin:          idleMin,
+		IdleOffPending:      idlePending,
+		IdleOffRemainingSec: idleRemaining,
+		IdleOffError:        idleFault,
 	}, nil
 }
 
@@ -3501,13 +4705,12 @@ func (m *module) routes() http.Handler {
 			return
 		}
 		current := m.settings()
-		if body.MQTTPassword == "" && body.KeepPassword {
-			body.MQTTPassword = current.MQTTPassword
-		}
-		if body.HAToken == "" && body.KeepHAToken {
-			body.HAToken = current.HAToken
-		}
 		next := m.applyHostPins(body)
+		// A saved secret is kept only for the address it was saved for.
+		if err := errors.Join(keepPassword(body, current, &next), keepHAToken(body, current, &next)); err != nil {
+			refuse(w, r, InvalidInput.New(err.Error()))
+			return
+		}
 		// A save that turns the built-in broker on or changes its user name
 		// or password needs both. An install from before 0.5.0 that runs the
 		// built-in broker without them can still save its other settings;
@@ -3629,6 +4832,8 @@ func (m *module) routes() http.Handler {
 		answer(w, http.StatusOK, resp)
 	})
 
+	m.energyRoutes(mux)
+
 	mux.HandleFunc("GET /devices/{device_id}", func(w http.ResponseWriter, r *http.Request) {
 		deviceID := r.PathValue("device_id")
 		principal := m.principalOf(r)
@@ -3661,6 +4866,14 @@ func (m *module) routes() http.Handler {
 			refuse(w, r, InvalidInput.New("invalid HTTP plug IP, hostname, or URL"))
 			return
 		}
+		if body.effectiveDriver() == DriverHomeAssistant {
+			ent := strings.TrimSpace(body.HAEntityID)
+			pEnt := strings.TrimSpace(body.HAPowerEntityID)
+			if (ent != "" && !validHAEntity(ent, false)) || (pEnt != "" && !validHAEntity(pEnt, true)) {
+				refuse(w, r, InvalidInput.New(errUnsupportedHAEntity.Error()))
+				return
+			}
+		}
 		normalizedCfg := normalizeDeviceConfig(body)
 		candidateKey := normalizedCfg.plugKey()
 		relayIdx := normalizedCfg.relayIndex()
@@ -3681,6 +4894,10 @@ func (m *module) routes() http.Handler {
 			}
 		}
 		if err := m.saveConfig(r.Context(), deviceID, body); err != nil {
+			if errors.Is(err, errPlugPasswordRetype) {
+				refuse(w, r, InvalidInput.New(err.Error()))
+				return
+			}
 			refuse(w, r, InternalError.New(err.Error()))
 			return
 		}
@@ -3708,6 +4925,8 @@ func (m *module) routes() http.Handler {
 		principal := m.principalOf(r)
 		var body struct {
 			Action string `json:"action"` // "on", "off", "toggle"
+			// IdleOnly refuses to turn off a printer nothing is known of.
+			IdleOnly bool `json:"idle_only"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			refuse(w, r, InvalidInput.New(err.Error()))
@@ -3750,8 +4969,8 @@ func (m *module) routes() http.Handler {
 				refuse(w, r, InternalError.New(err.Error()))
 				return
 			}
-			if !safety.CanTurnOff {
-				refuse(w, r, PrinterBusy.New(safety.LockReason).With(fault.StringParam("state", safety.PrinterState)))
+			if reason, state, refused := offRefusal(safety, body.IdleOnly); refused {
+				refuse(w, r, PrinterBusy.New(reason).With(fault.StringParam("state", state)))
 				return
 			}
 		}
@@ -3812,6 +5031,40 @@ func (m *module) routes() http.Handler {
 		}
 
 		resp, err := m.buildStatus(r.Context(), principal, deviceID)
+		if err != nil {
+			refuse(w, r, InternalError.New(err.Error()))
+			return
+		}
+		answer(w, http.StatusOK, resp)
+	}))
+
+	mux.HandleFunc("POST /devices/{device_id}/idle-off", m.guard(mayOperate, func(w http.ResponseWriter, r *http.Request) {
+		deviceID := r.PathValue("device_id")
+		var body struct {
+			Action string `json:"action"` // "keep"
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			refuse(w, r, InvalidInput.New(err.Error()))
+			return
+		}
+		if strings.ToLower(strings.TrimSpace(body.Action)) != "keep" {
+			refuse(w, r, InvalidInput.New("action must be keep"))
+			return
+		}
+		cfg, err := m.getConfig(r.Context(), deviceID)
+		if err != nil {
+			refuse(w, r, InternalError.New(err.Error()))
+			return
+		}
+		if !cfg.configured() {
+			refuse(w, r, NotConfigured.New("no smart plug is set up for this printer"))
+			return
+		}
+		// The whole idle time starts again.
+		m.keepOn(deviceID, m.clock())
+		m.saveAutoOffIfChanged()
+
+		resp, err := m.buildStatus(r.Context(), m.principalOf(r), deviceID)
 		if err != nil {
 			refuse(w, r, InternalError.New(err.Error()))
 			return

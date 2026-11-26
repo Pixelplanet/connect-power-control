@@ -1,5 +1,67 @@
 # Changelog
 
+## 0.6.0 - 2026-11-26
+
+### New
+
+- **Power Control** has a second tab, **Energy**. It shows the energy and the cost of all printers or of one printer over a day, a week, a month or a year, a chart of the period, a table of the printers and a table of the prints. **Download CSV** saves the table on screen. Recording starts when this version is installed; earlier use is not filled in.
+- **Settings, Automation** has a new pane, **Energy and cost**: how long records are kept (365 days unless changed), the time zone that days follow, the currency label, the price per kWh and an optional night price with its hours. The first price also covers the energy recorded before it. A later price counts from the moment it is saved, unless you choose to use it for past energy too. Set a price after updating to see cost. With no price, no cost is shown; it is never 0.
+- A server in Docker often runs on UTC. Set the time zone in that pane, or accept the offer on the **Energy** tab, so that days and night hours follow your own clock.
+- Cost now shows wherever energy does: on the Now tab (today, this month, and cost per hour at the current draw), on the printer's page (this print, last print, since turned on, recent prints) and on the dashboard card (today and this month). All use the price rule of the Energy tab. A printer's page has a link, Energy and cost history, that opens the Energy tab for that printer.
+- A small amount reads "< 0.01" in place of "0.00", and the Cost card says why when it has no figure.
+- After a price is saved, the Energy and cost pane says what this month costs at that price and links to the Energy tab.
+- The Energy tab says what a running month or year is on course for, and the chart can show cost in place of energy.
+- The chart on the Energy tab can be used with the keyboard: the arrow keys, Home and End move the period that is read out.
+- The Now tab and the dashboard card say "partly measured" beside a figure of today or this month that a plug metered only part of the time, as the Energy tab does.
+- A printer that is on and idle can be turned off after a time you set on the Automation tab, for all printers or for one. It is off unless you set it. The printer's page counts down and offers Keep on. It never turns off a printer that is printing, paused, busy or moving, or one Connect cannot reach. While a turn-off after a print waits, the idle time does not run.
+- The Energy tab shows how much energy went into printing and how much was used while idle, with the cost of the idle part, and an Idle column for each printer. For energy recorded before this version the split is worked out from the print records.
+- The Now tab has a Turn off idle printers button. It asks first, and lists the printers it left on and why. A printer Connect cannot reach stays on.
+- The Energy tab has a third table, Files: energy and cost per file name, with the number of prints, the average per print and the prints that did not finish. Download CSV saves it.
+- The Plugs tab shows what a Tasmota plug, or a Shelly plug read by its address, does after a power cut: stays off, turns on or returns to the last state. A Tasmota plug set to stay on at all times (PowerOnState 4) gets a warning that says why it cannot be turned off. The setting is only read, never changed.
+- Tasmota and Shelly plugs show their Wi-Fi signal, and say so when the plug turned itself off because of too much power, heat or a wrong voltage.
+- The extension now tells the server's event stream when it turned a printer off (`auto_off.done`), when a turn-off failed (`auto_off.failed`), and when a plug or its broker went away during a print for more than a minute (`plug.lost`). A webhook or MQTT sink set up on the server receives them. The update asks you to approve these three events; without the approval nothing is sent and nothing else changes.
+- The diagnostics bundle an administrator downloads from the server's settings now holds a Power Control file: the driver of each plug and whether it answers, its last error, the state of the MQTT broker and of auto-off. It holds no password, no token and no address.
+
+### Changed
+
+- The extension now keeps energy per printer in 15-minute steps and every finished print in files under `energy/` in its data directory, about 1 MB per printer per year. Shortening the keep time deletes older records for good.
+- A plug with no meter shows "Not measured" in the **Energy** tab in place of 0 Wh.
+- The wait after a print is at most one day (86400 seconds), for all printers and for one. A larger saved value is brought down to that.
+- A Home Assistant plug must be a `switch`, `input_boolean`, `light` or `fan` entity, and its power reading a `sensor`. Other entities, such as covers or locks, are refused when saved and are not switched.
+- A port outside 1 to 65535 in a plug, broker or Home Assistant address is no longer accepted; the broker falls back to its default port. The reachability check of the built-in broker runs only when the broker listens on port 1883 or 8883.
+- Emptying the price per kWh now says, before you save, that it deletes every saved price and the cost of all past energy.
+- The MQTT form keeps Save off while the broker address changed and the saved password is not typed again, so a save no longer drops the password by mistake.
+- The forms and the extension now agree on what is the same address: `https://ha.example.com` and `https://ha.example.com:443`, a broker written as `broker.lan`, `broker.lan:1883` or `mqtt://broker.lan`, and a plug written with or without `http://`. Before, a save could be refused or ask for a kept secret that it would have kept.
+
+### Fixed
+
+- A print is no longer recorded as finished and split in two when its printer drops off the network or the server restarts. The record stays open for a short absence and goes on when the printer is back on the same print. A print that was cut, by a power cut for one, gets the outcome `interrupted`, in the Prints table and in the CSV.
+- Auto-off after a print now holds through a restart of the server or the extension. Before, a printer whose print ended during the restart stayed on. After a restart the printer is turned off only once Connect has seen it again.
+- A printer that drops off the network right after its print stopped is no longer turned off before Connect had time to record how the print ended. A print recorded as cancelled or failed keeps it on, as it does for a printer that is still connected.
+- Print start, end and outcome are taken from the server's own job record where it offers one.
+- After the extension was stopped for more than ten minutes, the wait after a print starts again once the printer is seen. Before, a printer turned on by hand could be turned off right after the restart for a print that ended before it.
+- A printer's settings saved while auto-off was turning that printer off are no longer overwritten by the older settings.
+- A plug that stopped answering, or whose MQTT broker is not connected, no longer adds energy. Before, its last reading kept counting until the plug came back. This also lowers the session and print figures on the **Now** tab and on the printer's page for such a time.
+- A print that ended while the extension was not running now ends at the last moment it was seen, and is marked as estimated (`end_estimated`), which the **Prints** table says under its end time.
+- Energy records are not deleted for their age while the saved energy settings cannot be read, or while fewer than three days of record lie inside the keep time, which is what a server clock that jumped ahead looks like. In the first case the **Energy and cost** pane says so and asks you to check the number of days; saving it ends the hold (`prune_paused` in `GET /energy/settings`).
+- A power, voltage or current value that is not a number, such as the `nan` some plugs send for a sensor with no value, is no longer taken as a reading. Before, the answers that carry that plug's readings were empty until the plug sent a number again. A power reading above 100 kW is not counted as energy.
+- Usage and energy records are now saved when the extension stops, and two saves can no longer share one temporary file. A temporary file that a cut-off save left in the data directory is removed at the next start.
+- Fix a Home Assistant power sensor that stopped answering. When the sensor is `unavailable` or `unknown`, the plug now shows no power reading and no energy is counted; before, the last reading stood and energy went on counting from it. The sensor's own unit is now read, so a sensor in kW or mW is no longer taken as watts, and a sensor that is no power sensor gives no reading.
+
+### Security
+
+- A saved secret is now used only with the address it was saved for. A save or a connection test that keeps the saved MQTT password, Home Assistant token or plug password but names another address is refused with `INVALID_INPUT` and sends nothing there; the forms ask for the secret again as soon as the address changes. For the MQTT broker, another port or turning TLS off counts as another address. Before, a person who may configure the extension could point a test at a server of their own and receive a secret they never saw. This also holds when `mqtt_host` or `ha_url` is changed in the server's settings for the extension: the saved password or token is not used with the new address until it is entered again, and comes back when the setting is removed.
+- The password of a Tasmota plug set up by address is no longer part of the error text when the plug does not answer. Before, the plug's page, the answer of a refused switch and the server log could show it.
+- A plug or Home Assistant server that answers with a redirect is no longer followed to the other address. The plug's page says so; enter the final address instead.
+- Switching between the built-in broker and an external one now asks for the password again, in both directions. Before, the external broker's saved password became the built-in broker's password.
+- The built-in broker closes a connection whose first packet is too large, takes at most 32 connections at a time that have not signed in yet, and answers a wrong password after one second.
+
+### API
+
+- New routes: `GET /energy`, `GET /energy/export`, `GET /energy/settings` and `PUT /energy/settings`. Changing the energy settings takes `configure_resource`. `GET /energy/export` answers CSV text in parts, each with an `as_of` to send back with the next part, so that a record made meanwhile does not move the rows.
+- New route `GET /energy/summary` (today, this month and the price that counts now). `GET /devices/{device_id}` answers `cost` for the session and the prints, with `currency` and `price_set`. `GET /energy` answers `files`, `files_total` and, on every figure, `print_wh`, `idle_wh`, `idle_cost`, `split_unknown_wh` and `split_estimated`. `GET /energy/export` takes `table=files`.
+- New route `POST /devices/{device_id}/idle-off`; new fields `idle_off_min`, `idle_off_pending`, `idle_off_remaining_sec`, `idle_off_error`, `wifi_dbm` and `protection`. `POST /devices/{device_id}/power` takes `idle_only`, which also refuses a printer Connect cannot reach.
+
 ## 0.5.0 - 2026-11-20
 
 - Add multi-plug driver support inside a single unified extension sharing safety interlocks, auto-off cooldown, 30-minute power graph, and session/print energy tracking:
