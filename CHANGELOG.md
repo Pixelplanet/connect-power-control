@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.6.1 - 2026-11-28
+
+### Fixed
+
+- Switching a Home Assistant plug no longer fails with "did not confirm OFF (reported ON)" when the plug did switch. Many integrations, such as TP-Link Kasa, change the entity's state a moment after the switch call; the extension now reads the state again for up to 2.5 seconds before it reports the plug as refusing, and stops at once if the entity becomes unavailable. ([#1](https://github.com/Pixelplanet/connect-power-control/issues/1))
+
 ## 0.6.0 - 2026-11-26
 
 ### New

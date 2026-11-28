@@ -1450,18 +1450,51 @@ func (m *module) switchHomeAssistantPlugVerified(ctx context.Context, cfg Device
 	if err != nil {
 		return err
 	}
-	if pollErr := m.pollHomeAssistantPlug(ctx, cfg); pollErr != nil {
-		return pollErr
+	return m.confirmHomeAssistantState(ctx, cfg, wantState)
+}
+
+// Many Home Assistant integrations change an entity's state a moment after
+// the service call returned, so the state is read again for a while before
+// a switch counts as refused, as the MQTT drivers wait for their answer.
+var (
+	haConfirmWait = 2500 * time.Millisecond
+	haConfirmStep = 250 * time.Millisecond
+)
+
+// confirmHomeAssistantState reads the entity until it reports wantState. It
+// gives up at once when the entity is unavailable or unknown, and otherwise
+// after haConfirmWait.
+func (m *module) confirmHomeAssistantState(ctx context.Context, cfg DeviceConfig, wantState string) error {
+	deadline := time.Now().Add(haConfirmWait)
+	key := cfg.plugKey()
+	var lastErr error
+	for {
+		lastErr = m.pollHomeAssistantPlug(ctx, cfg)
+		got, lost, reason := "", false, ""
+		m.mu.RLock()
+		if plug := m.plugs[key]; plug != nil {
+			got = plug.relayState(1)
+			if lastErr == nil && plug.Online != nil && !*plug.Online {
+				lost, reason = true, plug.LastError
+			}
+		}
+		m.mu.RUnlock()
+		if lastErr == nil && got == wantState {
+			return nil
+		}
+		if lost {
+			return fmt.Errorf("Home Assistant entity did not confirm %s (%s)", wantState, reason)
+		}
+		if !time.Now().Add(haConfirmStep).Before(deadline) {
+			if lastErr != nil {
+				return lastErr
+			}
+			return fmt.Errorf("Home Assistant entity did not confirm %s within %s (reported %s)", wantState, haConfirmWait, got)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(haConfirmStep):
+		}
 	}
-	m.mu.RLock()
-	plug := m.plugs[cfg.plugKey()]
-	got := ""
-	if plug != nil {
-		got = plug.relayState(1)
-	}
-	m.mu.RUnlock()
-	if got == wantState {
-		return nil
-	}
-	return fmt.Errorf("Home Assistant entity did not confirm %s (reported %s)", wantState, got)
 }

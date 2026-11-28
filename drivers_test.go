@@ -10,6 +10,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -959,5 +960,98 @@ func TestNoSSIDReachesAnAnswer(t *testing.T) {
 	}
 	if got := strings.Count(string(overview), `"wifi_dbm"`); got != 3 {
 		t.Errorf("the overview holds the signal of %d plugs, want 3: %s", got, overview)
+	}
+}
+
+// haLateServer is a Home Assistant whose switch takes on a new state only
+// after `lag` has passed since the service call, as many integrations do.
+// With after set, the entity reports that state in place of the new one.
+func haLateServer(t *testing.T, lag time.Duration, after string) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	var mu sync.Mutex
+	state, target := "on", "on"
+	var since time.Time
+	var reads atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		defer mu.Unlock()
+		if !since.IsZero() && time.Since(since) >= lag {
+			state = target
+		}
+		switch r.URL.Path {
+		case "/api/services/homeassistant/turn_on", "/api/services/homeassistant/turn_off":
+			target = "off"
+			if strings.HasSuffix(r.URL.Path, "turn_on") {
+				target = "on"
+			}
+			if after != "" {
+				target = after
+			}
+			since = time.Now()
+			_ = json.NewEncoder(w).Encode([]any{})
+		case "/api/states/switch.kasa_outlet":
+			reads.Add(1)
+			_ = json.NewEncoder(w).Encode(map[string]any{"entity_id": "switch.kasa_outlet", "state": state})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &reads
+}
+
+func haLateModule(t *testing.T, srv *httptest.Server, wait, step time.Duration) (*module, DeviceConfig) {
+	t.Helper()
+	oldWait, oldStep := haConfirmWait, haConfirmStep
+	haConfirmWait, haConfirmStep = wait, step
+	t.Cleanup(func() { haConfirmWait, haConfirmStep = oldWait, oldStep })
+	m := newModule(nil)
+	s := normalizeSettings(Settings{HAURL: srv.URL, HAToken: "t"})
+	m.held.Store(&s)
+	return m, normalizeDeviceConfig(DeviceConfig{Driver: DriverHomeAssistant, HAEntityID: "switch.kasa_outlet"})
+}
+
+// Issue 1: a plug whose state lands after the service call returned was
+// reported as refused although it switched.
+func TestHomeAssistantSwitchWaitsForALateState(t *testing.T) {
+	srv, reads := haLateServer(t, 120*time.Millisecond, "")
+	m, cfg := haLateModule(t, srv, 2*time.Second, 20*time.Millisecond)
+	if err := m.switchHomeAssistantPlugVerified(context.Background(), cfg, false); err != nil {
+		t.Fatalf("a late OFF must count as confirmed: %v", err)
+	}
+	if reads.Load() < 2 {
+		t.Fatalf("the state was read %d times; it must be read again until it matches", reads.Load())
+	}
+	m.mu.RLock()
+	got := m.plugs[cfg.plugKey()].relayState(1)
+	m.mu.RUnlock()
+	if got != "OFF" {
+		t.Fatalf("plug state after the switch is %q, want OFF", got)
+	}
+}
+
+func TestHomeAssistantSwitchThatNeverChangesIsRefused(t *testing.T) {
+	srv, _ := haLateServer(t, 0, "on")
+	m, cfg := haLateModule(t, srv, 150*time.Millisecond, 20*time.Millisecond)
+	start := time.Now()
+	err := m.switchHomeAssistantPlugVerified(context.Background(), cfg, false)
+	if err == nil || !strings.Contains(err.Error(), "did not confirm OFF") || !strings.Contains(err.Error(), "reported ON") {
+		t.Fatalf("want a refusal that names the reported state, got %v", err)
+	}
+	if took := time.Since(start); took > time.Second {
+		t.Fatalf("the wait took %s, longer than its limit", took)
+	}
+}
+
+func TestHomeAssistantSwitchStopsWaitingWhenTheEntityIsUnavailable(t *testing.T) {
+	srv, reads := haLateServer(t, 0, "unavailable")
+	m, cfg := haLateModule(t, srv, 5*time.Second, 20*time.Millisecond)
+	start := time.Now()
+	err := m.switchHomeAssistantPlugVerified(context.Background(), cfg, false)
+	if err == nil || !strings.Contains(err.Error(), "unavailable") {
+		t.Fatalf("want a refusal that says the entity is unavailable, got %v", err)
+	}
+	if took := time.Since(start); took > time.Second || reads.Load() > 2 {
+		t.Fatalf("an unavailable entity must end the wait at once (took %s, %d reads)", took, reads.Load())
 	}
 }

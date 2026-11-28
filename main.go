@@ -37,7 +37,7 @@ import (
 const (
 	name    = "connect-power-control"
 	logName = "connect-power-control"
-	release = extension.Version("0.6.0")
+	release = extension.Version("0.6.1")
 
 	defaultMQTTPort     = 1883
 	defaultMQTTTLSPort  = 8883
